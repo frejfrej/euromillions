@@ -6,13 +6,16 @@ Build a Python tool that fetches historical EuroMillions draw results, performs 
 
 > **Disclaimer**: Lottery draws are random. No statistical method can predict or guarantee winning numbers. This project is for educational and entertainment purposes only.
 
+**Status**: all six phases below are implemented and tested.
+
 ---
 
 ## EuroMillions Rules (Quick Reference)
 
 - **5 main numbers** from 1–50
-- **2 Lucky Stars** from 1–12
-- Draws happen **Tuesday and Friday**
+- **2 Lucky Stars** from 1–12 (1–9 until May 2011, 1–11 until September 2016)
+- Draws happen **Tuesday and Friday**, around 21:05 Paris time (Fridays only until May 2011)
+- **13 prize ranks**, from 5 numbers + 2 stars (jackpot) down to 2 numbers; a line costs €2.50 in France
 
 ---
 
@@ -24,17 +27,16 @@ euromillions/
 ├── src/
 │   └── euromillions/
 │       ├── __init__.py
-│       ├── fetcher.py      # Download / scrape historical draw data
-│       ├── models.py       # Data models (Draw, Suggestion, etc.)
+│       ├── __main__.py     # `python -m euromillions`
+│       ├── models.py       # Game rules and data models (Draw, PrizeTier, Suggestion)
+│       ├── schedule.py     # Draw schedule (next / previous draw)
+│       ├── fetcher.py      # Download, parse and cache the draw history
 │       ├── analyzer.py     # Statistical analysis engine
 │       ├── suggester.py    # Number suggestion strategies
+│       ├── backtest.py     # Evaluation of the strategies on held-out draws
 │       └── cli.py          # Command-line interface
-├── tests/
-│   ├── __init__.py
-│   ├── test_fetcher.py
-│   ├── test_analyzer.py
-│   └── test_suggester.py
-├── data/                   # Cached CSV / JSON draw history
+├── tests/                  # One test module per source module, plus fixtures
+├── data/                   # Cached draw history (draws.json, not committed)
 ├── PLAN.md
 └── README.md               (only if requested)
 ```
@@ -46,7 +48,7 @@ euromillions/
 ### Phase 1 — Data Acquisition (`fetcher.py`, `models.py`)
 
 - Define a `Draw` dataclass: date, 5 main numbers, 2 lucky stars, prize info (optional).
-- Fetch historical results from a public source (e.g., the official euromillions.com results page, or a public CSV/API such as `lottolyzer` datasets).
+- Fetch historical results from a public source: the zipped CSV archives published by the French operator FDJ, linked from its history page (every draw since 2004, with the winners and prize of each rank).
 - Cache results locally as JSON/CSV in `data/` so we don't re-fetch every run.
 - Parse and validate data (numbers in range, no duplicates per draw, etc.).
 
@@ -92,6 +94,9 @@ python -m euromillions analyze [--last N]
 # Suggest numbers
 python -m euromillions suggest [--strategy hot|cold|balanced|weighted|anti] [--lines 5]
 
+# Evaluate the strategies on held-out draws
+python -m euromillions backtest [--strategy NAME] [--train-fraction 0.8] [--lines 5] [--static]
+
 # Show next draw date
 python -m euromillions next-draw
 ```
@@ -101,17 +106,28 @@ python -m euromillions next-draw
 - Unit tests for parsing, analysis calculations, and suggestion constraints.
 - Ensure suggested numbers always satisfy EuroMillions rules (5 unique numbers 1–50, 2 unique stars 1–12).
 
+### Phase 6 — Backtesting (`backtest.py`)
+
+Check the hypotheses behind the strategies on data they have not seen, and measure what the suggested lines would have earned:
+
+- Split the history: the oldest part (80% by default) only serves to build statistics, the rest is the evaluation set.
+- Play every evaluated draw with lines suggested from the draws that precede it (statistics updated before each draw, or frozen on the training set with `--static`). No line ever depends on the draw it is scored on.
+- Score the lines with the prizes really paid that day for each rank, shared with the actual winners; report cost, winnings, net result and return on stake per strategy.
+- Compare every strategy with a uniformly random baseline and with pure chance: share of winning lines, average numbers and stars matched per line, with exact z-scores. A strategy with predictive power would stand out; random draws leave them all within noise.
+- Only draws under the current rules (since 27 September 2016) are evaluated, as earlier ones had other star pools and prize ranks.
+
 ---
 
 ## Dependencies
 
 | Package | Purpose |
 |---|---|
-| `requests` / `httpx` | HTTP fetching |
-| `beautifulsoup4` | HTML parsing (if scraping) |
-| `pandas` | Data analysis (optional, can use stdlib) |
+| `requests` | HTTP fetching |
+| `beautifulsoup4` | HTML parsing (archive links on the history page) |
 | `click` | CLI framework |
-| `pytest` | Testing |
+| `pytest`, `ruff`, `mypy` | Testing, linting, type checking (dev) |
+
+The analysis uses the standard library only (no `pandas`).
 
 ---
 
@@ -122,4 +138,5 @@ python -m euromillions next-draw
 3. `analyzer.py` — crunch the numbers
 4. `suggester.py` — generate suggestions
 5. `cli.py` — tie it all together
-6. Tests throughout each step
+6. `backtest.py` — evaluate the strategies on held-out draws
+7. Tests throughout each step
