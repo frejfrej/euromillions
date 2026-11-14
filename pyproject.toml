@@ -9,6 +9,7 @@ description = "EuroMillions number analyzer and suggestion tool"
 requires-python = ">=3.10"
 dependencies = [
     "requests>=2.31",
+    "urllib3>=1.26",
     "beautifulsoup4>=4.12",
     "click>=8.1",
     "tzdata; sys_platform == 'win32'",
@@ -20,6 +21,8 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.8",
     "types-requests",
+    # Type hints ship with beautifulsoup4 from 4.13 on; mypy needs them.
+    "beautifulsoup4>=4.13",
 ]
 
 [project.scripts]
