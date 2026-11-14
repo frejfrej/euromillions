@@ -8,8 +8,12 @@ import json
 import pytest
 
 from euromillions.models import (
+    CURRENT_RULES_SINCE,
     FIRST_DRAW_DATE,
+    LINE_PRICE,
+    PRIZE_RANKS,
     Draw,
+    PrizeTier,
     Suggestion,
     format_line,
     picks_per_draw,
@@ -48,6 +52,31 @@ class TestPools:
     def test_picks_per_draw(self) -> None:
         assert picks_per_draw("main") == 5
         assert picks_per_draw("star") == 2
+
+
+class TestCurrentRules:
+    def test_current_rules_started_with_the_twelfth_star(self) -> None:
+        assert CURRENT_RULES_SINCE == dt.date(2016, 9, 27)
+        assert star_pool_size(CURRENT_RULES_SINCE) == 12
+        assert star_pool_size(CURRENT_RULES_SINCE - dt.timedelta(days=1)) == 11
+
+    def test_line_price(self) -> None:
+        assert LINE_PRICE == 2.5
+
+    def test_thirteen_prize_ranks_from_the_jackpot_down(self) -> None:
+        by_rank = {rank: matches for matches, rank in PRIZE_RANKS.items()}
+        assert sorted(by_rank) == list(range(1, 14))
+        assert by_rank[1] == (5, 2)
+        assert by_rank[2] == (5, 1)
+        assert by_rank[3] == (5, 0)
+        # Three numbers and both stars pay more than four numbers alone.
+        assert by_rank[6] == (3, 2)
+        assert by_rank[7] == (4, 0)
+        assert by_rank[13] == (2, 0)
+
+    @pytest.mark.parametrize("matches", [(0, 0), (1, 0), (0, 1), (1, 1), (0, 2)])
+    def test_too_few_matches_win_nothing(self, matches: tuple[int, int]) -> None:
+        assert matches not in PRIZE_RANKS
 
 
 class TestDraw:
@@ -110,20 +139,21 @@ class TestDraw:
         with pytest.raises(ValueError, match=r"datetime\.date"):
             Draw(date, (1, 2, 3, 4, 5), (1, 2))  # type: ignore[arg-type]
 
-    @pytest.mark.parametrize("winners", [-1, 1.5, True, "2"])
-    def test_rejects_invalid_jackpot_winners(self, winners: object) -> None:
-        with pytest.raises(ValueError, match="jackpot_winners"):
-            Draw(CURRENT, (1, 2, 3, 4, 5), (1, 2), jackpot_winners=winners)  # type: ignore[arg-type]
+    def test_prizes_default_to_unknown(self) -> None:
+        draw = Draw(CURRENT, (1, 2, 3, 4, 5), (1, 2))
+        assert draw.prizes == ()
+        assert draw.jackpot is None
 
-    @pytest.mark.parametrize("prize", [-0.01, float("nan"), True, "17000000"])
-    def test_rejects_invalid_jackpot_prize(self, prize: object) -> None:
-        with pytest.raises(ValueError, match="jackpot_prize"):
-            Draw(CURRENT, (1, 2, 3, 4, 5), (1, 2), jackpot_prize=prize)  # type: ignore[arg-type]
+    def test_prizes_are_kept_in_rank_order(self) -> None:
+        tiers = [PrizeTier(1, 17_000_000.0), PrizeTier(4, 250_000.5), PrizeTier(9, 30_000.0)]
+        draw = Draw(CURRENT, (1, 2, 3, 4, 5), (1, 2), tiers)  # type: ignore[arg-type]
+        assert draw.prizes == tuple(tiers)
+        assert draw.jackpot == PrizeTier(1, 17_000_000.0)
 
-    def test_jackpot_prize_is_stored_as_float(self) -> None:
-        draw = Draw(CURRENT, (1, 2, 3, 4, 5), (1, 2), jackpot_winners=1, jackpot_prize=17_000_000)
-        assert draw.jackpot_prize == 17_000_000.0
-        assert isinstance(draw.jackpot_prize, float)
+    @pytest.mark.parametrize("prizes", [[(1, 2.0)], [None], ["17000000"], [PrizeTier(1, 2.0), 3]])
+    def test_rejects_prizes_that_are_not_prize_tiers(self, prizes: list[object]) -> None:
+        with pytest.raises(ValueError, match="PrizeTier"):
+            Draw(CURRENT, (1, 2, 3, 4, 5), (1, 2), prizes)  # type: ignore[arg-type]
 
     def test_str(self) -> None:
         assert str(Draw(CURRENT, (34, 8, 16, 10, 4), (8, 4))) == (
@@ -131,20 +161,48 @@ class TestDraw:
         )
 
 
+class TestPrizeTier:
+    def test_prize_is_stored_as_float(self) -> None:
+        tier = PrizeTier(3, 17_000_000)
+        assert tier == PrizeTier(3, 17_000_000.0)
+        assert isinstance(tier.prize, float)
+
+    def test_nobody_won(self) -> None:
+        assert PrizeTier(0, 0.0).winners == 0
+
+    @pytest.mark.parametrize("winners", [-1, 1.5, True, "2", None, float("nan")])
+    def test_rejects_invalid_winners(self, winners: object) -> None:
+        with pytest.raises(ValueError, match="winners"):
+            PrizeTier(winners, 10.0)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "prize", [-0.01, float("nan"), float("inf"), True, "17000000", None, [1.0]]
+    )
+    def test_rejects_invalid_prize(self, prize: object) -> None:
+        with pytest.raises(ValueError, match="prize"):
+            PrizeTier(1, prize)  # type: ignore[arg-type]
+
+    def test_is_immutable_and_hashable(self) -> None:
+        tier = PrizeTier(1, 2.0)
+        with pytest.raises(AttributeError):
+            tier.winners = 2  # type: ignore[misc]
+        assert len({tier, PrizeTier(1, 2)}) == 1
+
+
 class TestDrawSerialisation:
-    def test_round_trip_with_jackpot(self) -> None:
-        draw = Draw(CURRENT, (4, 8, 10, 16, 34), (4, 8), jackpot_winners=2, jackpot_prize=1234.5)
+    def test_round_trip_with_prizes(self) -> None:
+        prizes = (PrizeTier(0, 0.0), PrizeTier(4, 175_411.7), PrizeTier(1_035_060, 4.3))
+        draw = Draw(CURRENT, (4, 8, 10, 16, 34), (4, 8), prizes)
         data = draw.to_dict()
         assert data == {
             "date": "2024-07-23",
             "numbers": [4, 8, 10, 16, 34],
             "stars": [4, 8],
-            "jackpot_winners": 2,
-            "jackpot_prize": 1234.5,
+            "prizes": [[0, 0.0], [4, 175_411.7], [1_035_060, 4.3]],
         }
         assert Draw.from_dict(json.loads(json.dumps(data))) == draw
 
-    def test_round_trip_without_jackpot_omits_the_keys(self) -> None:
+    def test_round_trip_without_prizes_omits_the_key(self) -> None:
         draw = Draw(CURRENT, (4, 8, 10, 16, 34), (4, 8))
         data = draw.to_dict()
         assert set(data) == {"date", "numbers", "stars"}
@@ -161,6 +219,27 @@ class TestDrawSerialisation:
             {"date": "2024-07-23", "numbers": 12345, "stars": [1, 2]},
             {"date": "2024-07-23", "numbers": [1, 2, 3, 4, 99], "stars": [1, 2]},
             {"date": "2024-07-23", "numbers": [1, 2, 3, 4, 5], "stars": [[1], [2]]},
+            {"date": "2024-07-23", "numbers": [1, 2, 3, 4, 5], "stars": [1, 2], "prizes": 3},
+            {"date": "2024-07-23", "numbers": [1, 2, 3, 4, 5], "stars": [1, 2], "prizes": [[1]]},
+            {"date": "2024-07-23", "numbers": [1, 2, 3, 4, 5], "stars": [1, 2], "prizes": [7]},
+            {
+                "date": "2024-07-23",
+                "numbers": [1, 2, 3, 4, 5],
+                "stars": [1, 2],
+                "prizes": [[1, 2.0, 3]],
+            },
+            {
+                "date": "2024-07-23",
+                "numbers": [1, 2, 3, 4, 5],
+                "stars": [1, 2],
+                "prizes": [[-1, 2.0]],
+            },
+            {
+                "date": "2024-07-23",
+                "numbers": [1, 2, 3, 4, 5],
+                "stars": [1, 2],
+                "prizes": [["1", "2.0"]],
+            },
             ["2024-07-23", [1, 2, 3, 4, 5], [1, 2]],
             None,
         ],

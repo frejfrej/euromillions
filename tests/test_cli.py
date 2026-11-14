@@ -13,7 +13,9 @@ from click.testing import CliRunner, Result
 
 from euromillions import __version__, fetcher, schedule
 from euromillions.cli import DISCLAIMER, _describe_draw, _format_countdown, _ranking, cli
-from euromillions.models import Draw
+from euromillions.models import Draw, PrizeTier
+
+from .conftest import TYPICAL_PRIZES, HistoryFactory
 
 LINE_PATTERN = re.compile(r"^ +\d+\.  (\d\d ){5}\| stars \d\d \d\d$", re.MULTILINE)
 PARIS = schedule.DRAW_TIMEZONE
@@ -35,7 +37,7 @@ class TestGeneral:
     def test_help_lists_the_commands(self) -> None:
         result = run("--help")
         assert result.exit_code == 0
-        for command in ("fetch", "analyze", "suggest", "next-draw"):
+        for command in ("fetch", "analyze", "suggest", "backtest", "next-draw"):
             assert command in result.output
 
     def test_version(self) -> None:
@@ -59,13 +61,13 @@ class TestGeneral:
         monkeypatch.setenv("EUROMILLIONS_DATA_DIR", str(data_dir))
         assert run("suggest", "--lines", "1").exit_code == 0
 
-    @pytest.mark.parametrize("command", ["analyze", "suggest"])
+    @pytest.mark.parametrize("command", ["analyze", "suggest", "backtest"])
     def test_missing_cache_tells_the_user_to_fetch(self, command: str, tmp_path: Path) -> None:
         result = run(command, data_dir=tmp_path)
         assert result.exit_code == 1
         assert "euromillions fetch" in result.output
 
-    @pytest.mark.parametrize("command", ["analyze", "suggest"])
+    @pytest.mark.parametrize("command", ["analyze", "suggest", "backtest"])
     def test_corrupt_cache_is_reported_cleanly(self, command: str, tmp_path: Path) -> None:
         (tmp_path / fetcher.CACHE_FILENAME).write_text("{not json", encoding="utf-8")
         result = run(command, data_dir=tmp_path)
@@ -156,8 +158,8 @@ class TestAnalyze:
         for expected in (
             "MAIN NUMBERS (5 drawn from 1-50)",
             "LUCKY STARS (2 drawn from 1-12)",
-            "Most frequent",
-            "Least frequent",
+            "Most drawn",
+            "Least drawn",
             "Hot, last 50",
             "Cold, last 50",
             "Most overdue",
@@ -173,6 +175,27 @@ class TestAnalyze:
         ):
             assert expected in result.output
         assert "Gap now" not in result.output  # the per-number table needs --full
+        assert "Not all of them were in the pool" not in result.output
+
+    def test_no_number_is_both_most_and_least_drawn(self, data_dir: Path) -> None:
+        result = run("analyze", "--top", "40", data_dir=data_dir)
+        stars = result.output.split("LUCKY STARS")[1].split("COMBINATIONS")[0]
+        most, least = (
+            re.findall(r"(\d+) \(", stars.split(label)[1].split("\n  ")[0])
+            for label in ("Most drawn", "Least drawn")
+        )
+        assert len(most) == len(least) == 6
+        assert not set(most) & set(least)
+
+    def test_stars_that_joined_later_are_explained(
+        self, tmp_path: Path, make_history: HistoryFactory
+    ) -> None:
+        # 100 draws from March 2016 straddle the arrival of the twelfth star.
+        history = make_history(100, start=dt.date(2016, 3, 1))
+        fetcher.save_draws(history, tmp_path / fetcher.CACHE_FILENAME)
+        result = run("analyze", data_dir=tmp_path)
+        assert result.exit_code == 0
+        assert result.output.count("Not all of them were in the pool") == 1
 
     @pytest.mark.parametrize("arguments", [("--top", "15"), ("--full",), ("--last", "3")])
     def test_output_fits_in_80_columns(self, arguments: tuple[str, ...], data_dir: Path) -> None:
@@ -193,7 +216,16 @@ class TestAnalyze:
         (overdue,) = (
             line for line in result.output.split("LUCKY STARS")[0].splitlines() if "overdue" in line
         )
-        assert overdue.count("draws)") == 3
+        assert len(re.findall(r"\d+ draws?\)", overdue)) == 3
+
+    def test_counts_are_singular_when_they_should(
+        self, tmp_path: Path, history: list[Draw]
+    ) -> None:
+        fetcher.save_draws(history[:2], tmp_path / fetcher.CACHE_FILENAME)
+        result = run("analyze", data_dir=tmp_path)
+        assert result.exit_code == 0
+        assert "(1 draw)" in result.output
+        assert "(1 draws)" not in result.output
 
     def test_full_prints_one_row_per_number_and_star(self, data_dir: Path) -> None:
         result = run("analyze", "--full", data_dir=data_dir)
@@ -215,6 +247,7 @@ class TestSuggest:
         assert f"Strategy: {strategy} - " in result.output
         assert len(LINE_PATTERN.findall(result.output)) == 4
         assert DISCLAIMER in result.output
+        assert max(len(line) for line in result.output.splitlines()) <= 80
 
     def test_defaults_to_five_balanced_lines(self, data_dir: Path) -> None:
         result = run("suggest", data_dir=data_dir)
@@ -246,6 +279,131 @@ class TestSuggest:
         result = run("suggest", "--strategy", "anti", data_dir=tmp_path)
         assert result.exit_code == 1
         assert "Error: the anti strategy needs at least 20 draws" in result.output
+
+
+class TestBacktest:
+    @pytest.fixture
+    def paid_dir(self, tmp_path: Path, paid_history: list[Draw]) -> Path:
+        """A data directory whose cache holds 400 random draws with their prizes."""
+        fetcher.save_draws(paid_history, tmp_path / fetcher.CACHE_FILENAME)
+        return tmp_path
+
+    def test_compares_every_strategy_with_chance(
+        self, paid_dir: Path, paid_history: list[Draw]
+    ) -> None:
+        result = run("backtest", "--seed", "1", data_dir=paid_dir)
+        assert result.exit_code == 0
+        assert (
+            f"Backtest on 80 draws from {paid_history[320].date} to {paid_history[-1].date}."
+            in result.output
+        )
+        assert f"the 320 draws from {paid_history[0].date} to {paid_history[319].date}" in (
+            " ".join(result.output.split())
+        )
+        assert "400 lines for EUR 1,000.00 per strategy" in " ".join(result.output.split())
+        rows = {
+            line.split()[0]: line.split()
+            for line in result.output.splitlines()
+            if re.match(r"^(hot|cold|balanced|weighted|anti|random) ", line)
+        }
+        assert list(rows) == ["hot", "cold", "balanced", "weighted", "anti", "random"]
+        for row in rows.values():
+            winnings, net, roi = (float(cell.replace(",", "").rstrip("%")) for cell in row[1:4])
+            assert net == pytest.approx(winnings - 1000.0, abs=0.011)
+            assert roi == pytest.approx(net / 10.0, abs=0.051)
+        assert re.search(r"^by chance +7\.7%  0\.500 +0\.333$", result.output, re.MULTILINE)
+        assert DISCLAIMER in result.output
+        assert max(len(line) for line in result.output.splitlines()) <= 80
+
+    def test_seed_makes_the_output_reproducible(self, paid_dir: Path) -> None:
+        first = run("backtest", "--seed", "4", "--strategy", "hot", data_dir=paid_dir).output
+        assert (
+            run("backtest", "--seed", "4", "--strategy", "hot", data_dir=paid_dir).output == first
+        )
+        assert (
+            run("backtest", "--seed", "5", "--strategy", "hot", data_dir=paid_dir).output != first
+        )
+
+    def test_chosen_strategies_lines_fraction_and_price(self, paid_dir: Path) -> None:
+        result = run(
+            "backtest",
+            "--strategy",
+            "cold",
+            "--strategy",
+            "random",
+            "--train-fraction",
+            "0.9",
+            "--lines",
+            "2",
+            "--price",
+            "2.2",
+            "--seed",
+            "1",
+            data_dir=paid_dir,
+        )
+        assert result.exit_code == 0
+        assert "Backtest on 40 draws" in result.output
+        assert "80 lines for EUR 176.00 per strategy" in " ".join(result.output.split())
+        names = re.findall(r"^(hot|cold|balanced|weighted|anti|random) ", result.output, re.M)
+        assert names == ["cold", "random"]
+
+    def test_static_replays_the_lines_of_the_training_set(self, paid_dir: Path) -> None:
+        result = run("backtest", "--static", "--seed", "1", data_dir=paid_dir)
+        assert result.exit_code == 0
+        assert "suggested once from the 320 draws" in " ".join(result.output.split())
+        assert "replayed unchanged" in " ".join(result.output.split())
+        refreshed = run("backtest", "--seed", "1", data_dir=paid_dir)
+        assert "then every draw since" in " ".join(refreshed.output.split())
+
+    def test_reports_the_biggest_win(self, paid_dir: Path) -> None:
+        result = run("backtest", "--seed", "1", data_dir=paid_dir)
+        assert re.search(
+            r"^Biggest win: EUR [\d,]+\.\d\d by \w+ on \d{4}-\d\d-\d\d "
+            r"\(\d numbers? \+ \d stars?\)\.$",
+            result.output,
+            re.MULTILINE,
+        )
+
+    def test_draws_without_prize_data_are_reported(
+        self, tmp_path: Path, paid_history: list[Draw]
+    ) -> None:
+        last = paid_history[-1]
+        history = [*paid_history[:-1], Draw(last.date, last.numbers, last.stars)]
+        fetcher.save_draws(history, tmp_path / fetcher.CACHE_FILENAME)
+        result = run("backtest", "--strategy", "random", "--seed", "1", data_dir=tmp_path)
+        assert result.exit_code == 0
+        assert "Backtest on 79 draws" in result.output
+        assert "1 draw without prize data could not be played." in result.output
+
+    def test_errors_are_reported_cleanly(self, data_dir: Path) -> None:
+        # The cache of this fixture has no prize data at all.
+        result = run("backtest", data_dir=data_dir)
+        assert result.exit_code == 1
+        assert "Error: none of the draws to evaluate has prize data" in result.output
+        assert "Traceback" not in result.output
+
+    def test_evaluation_before_the_current_rules_is_refused(
+        self, tmp_path: Path, make_history: HistoryFactory
+    ) -> None:
+        history = make_history(99, start=dt.date(2016, 3, 1), prizes=TYPICAL_PRIZES)
+        fetcher.save_draws(history, tmp_path / fetcher.CACHE_FILENAME)
+        result = run("backtest", "--train-fraction", "0.5", data_dir=tmp_path)
+        assert result.exit_code == 1
+        assert "use a train fraction of at least 0.607" in result.output
+
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            ("--strategy", "lucky"),
+            ("--train-fraction", "0"),
+            ("--train-fraction", "1"),
+            ("--lines", "0"),
+            ("--window", "0"),
+            ("--price", "-1"),
+        ],
+    )
+    def test_rejects_invalid_options(self, arguments: tuple[str, ...], data_dir: Path) -> None:
+        assert run("backtest", *arguments, data_dir=data_dir).exit_code == 2
 
 
 class TestNextDraw:
@@ -284,17 +442,17 @@ class TestFormatting:
         assert _format_countdown(upcoming, now) == "in 4 days 1 hour"
 
     @pytest.mark.parametrize(
-        ("winners", "prize", "expected"),
+        ("jackpot", "expected"),
         [
-            (None, None, ""),
-            (0, 0.0, " (jackpot not won)"),
-            (1, 17_000_000.0, " (jackpot won, 1 winner, EUR 17,000,000 each)"),
-            (2, 8_500_000.4, " (jackpot won, 2 winners, EUR 8,500,000 each)"),
-            (1, None, " (jackpot won, 1 winner)"),
+            (None, ""),
+            (PrizeTier(0, 0.0), " (jackpot not won)"),
+            (PrizeTier(1, 17_000_000.0), " (jackpot won: 1 winner, EUR 17,000,000 each)"),
+            (PrizeTier(2, 8_500_000.4), " (jackpot won: 2 winners, EUR 8,500,000 each)"),
         ],
     )
-    def test_describe_draw(self, winners: int | None, prize: float | None, expected: str) -> None:
-        draw = Draw(dt.date(2026, 11, 13), (16, 27, 32, 41, 45), (2, 12), winners, prize)
+    def test_describe_draw(self, jackpot: PrizeTier | None, expected: str) -> None:
+        prizes = () if jackpot is None else (jackpot, *TYPICAL_PRIZES[1:])
+        draw = Draw(dt.date(2026, 11, 13), (16, 27, 32, 41, 45), (2, 12), prizes)
         assert _describe_draw(draw) == f"2026-11-13: 16 27 32 41 45 | stars 02 12{expected}"
 
     def test_ranking_wraps_between_entries_only(self) -> None:

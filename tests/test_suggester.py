@@ -108,9 +108,7 @@ class TestSuggest:
 
     @pytest.mark.parametrize("strategy", ["hot", "cold", "balanced", "weighted"])
     @pytest.mark.parametrize("size", [1, 2, 5])
-    def test_works_with_a_tiny_history(
-        self, strategy: str, size: int, history: list[Draw]
-    ) -> None:
+    def test_works_with_a_tiny_history(self, strategy: str, size: int, history: list[Draw]) -> None:
         assert len(suggest(history[:size], strategy, lines=3, seed=11)) == 3
 
     def test_window_larger_than_the_history_is_fine(self, history: list[Draw]) -> None:
@@ -119,7 +117,7 @@ class TestSuggest:
 
 class TestArgumentValidation:
     def test_unknown_strategy(self, history: list[Draw]) -> None:
-        with pytest.raises(ValueError, match="unknown strategy 'lucky'.*hot.*anti"):
+        with pytest.raises(ValueError, match=r"unknown strategy 'lucky'.*hot.*anti"):
             suggest(history, "lucky")
 
     @pytest.mark.parametrize("lines", [0, -1])
@@ -157,9 +155,12 @@ class TestStrategyBehaviour:
         assert average_hits(lines, COLD_NUMBERS) < 0.25
 
     def test_hot_only_looks_at_the_recent_window(self, skewed_history: list[Draw]) -> None:
-        # Ignoring the 30 most recent draws leaves a window in which 1-5 are not special.
-        lines = suggest(skewed_history[:-30], "hot", lines=300, seed=1)
-        assert average_hits(lines, HOT_NUMBERS) < 1.0
+        # Without its 30 most recent draws, the history has a window in which 1-5 are ordinary.
+        with_streak = suggest(skewed_history, "hot", lines=300, seed=1)
+        without_streak = suggest(skewed_history[:-30], "hot", lines=300, seed=1)
+        assert (
+            average_hits(with_streak, HOT_NUMBERS) > average_hits(without_streak, HOT_NUMBERS) + 0.5
+        )
 
     def test_cold_favours_overdue_numbers(self, skewed_history: list[Draw]) -> None:
         lines = suggest(skewed_history, "cold", lines=300, seed=1)
@@ -201,20 +202,22 @@ class TestStrategyBehaviour:
         assert share_with_seven > 0.25  # 0.10 for uniformly random lines
 
     def test_weighted_favours_numbers_often_drawn_together(self, history: list[Draw]) -> None:
-        # 11 and 22 are drawn together in a third of the draws: picking one of
-        # them makes the other more likely to complete the line.
-        rng = random.Random(4)
-        reshaped = []
-        for index, draw in enumerate(history):
-            others = rng.sample([n for n in range(1, 51) if n not in (11, 22)], 5)
-            numbers = (11, 22, *others[:3]) if index % 3 == 0 else tuple(others)
-            reshaped.append(Draw(draw.date, numbers, draw.stars))
-        lines = suggest(reshaped, "weighted", lines=2000, seed=6)
-        with_11 = [line for line in lines if 11 in line.numbers]
-        without_11 = [line for line in lines if 11 not in line.numbers]
-        share_given_11 = sum(22 in line.numbers for line in with_11) / len(with_11)
-        share_without_11 = sum(22 in line.numbers for line in without_11) / len(without_11)
-        assert share_given_11 > 1.3 * share_without_11
+        # 11 and 22 each come up in a third of the draws, either always together
+        # or never together: only the pair affinity differs between the two histories.
+        def share_of_lines_with_both(together: bool) -> float:
+            rng = random.Random(4)
+            reshaped = []
+            for index, draw in enumerate(history):
+                others = rng.sample([n for n in range(1, 51) if n not in (11, 22)], 5)
+                forced = {0: (11, 22) if together else (11,), 1: () if together else (22,)}
+                numbers = (*forced.get(index % 3, ()), *others)[:5]
+                reshaped.append(Draw(draw.date, numbers, draw.stars))
+            lines = suggest(reshaped, "weighted", lines=2000, seed=6)
+            return sum({11, 22} <= set(line.numbers) for line in lines) / len(lines)
+
+        assert share_of_lines_with_both(together=True) > 1.5 * share_of_lines_with_both(
+            together=False
+        )
 
     def test_anti_avoids_rare_patterns(self, history: list[Draw]) -> None:
         sums = analyzer.sum_distribution(history)

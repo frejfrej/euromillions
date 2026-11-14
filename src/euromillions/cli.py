@@ -1,4 +1,4 @@
-"""Command-line interface: ``euromillions fetch | analyze | suggest | next-draw``."""
+"""Command-line interface: ``euromillions fetch | analyze | suggest | backtest | next-draw``."""
 
 from __future__ import annotations
 
@@ -9,9 +9,18 @@ from pathlib import Path
 
 import click
 
-from euromillions import __version__, analyzer, fetcher, schedule, suggester
+from euromillions import __version__, analyzer, backtest, fetcher, schedule, suggester
 from euromillions.analyzer import AnalysisReport, Distribution, NumberStats
-from euromillions.models import MAIN_COUNT, MAIN_MAX, STAR_COUNT, STAR_MAX, Draw
+from euromillions.backtest import Backtest
+from euromillions.models import (
+    LINE_PRICE,
+    MAIN_COUNT,
+    MAIN_MAX,
+    PRIZE_RANKS,
+    STAR_COUNT,
+    STAR_MAX,
+    Draw,
+)
 
 DISCLAIMER = (
     "Lottery draws are random: past results cannot predict future ones.\n"
@@ -21,6 +30,8 @@ DISCLAIMER = (
 _WIDTH = 80
 _LABEL_WIDTH = 18
 _UTC = dt.timezone.utc
+#: (main numbers, Lucky Stars) to match for each prize rank.
+_RANK_MATCHES = {rank: matches for matches, rank in PRIZE_RANKS.items()}
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -57,7 +68,7 @@ def fetch(cache_path: Path, force: bool) -> None:
     if not result.downloaded:
         click.echo("Already up to date.")
     elif result.added:
-        click.echo(f"Added {result.added} new draw{'s' if result.added != 1 else ''}.")
+        click.echo(f"Added {_count(result.added, 'new draw')}.")
     else:
         click.echo("No new draw has been published yet.")
     draws = result.draws
@@ -134,6 +145,86 @@ def suggest(cache_path: Path, strategy: str, lines: int, window: int, seed: int 
     click.echo(DISCLAIMER)
 
 
+@cli.command("backtest")
+@click.option(
+    "--strategy",
+    "strategies",
+    multiple=True,
+    type=click.Choice(list(backtest.DEFAULT_STRATEGIES)),
+    help="Strategy to evaluate; repeat the option to compare several.  "
+    "[default: all of them and the random baseline]",
+)
+@click.option(
+    "--train-fraction",
+    type=click.FloatRange(0, 1, min_open=True, max_open=True),
+    default=0.8,
+    show_default=True,
+    help="Share of the history, oldest draws first, that only serves to build statistics.",
+)
+@click.option(
+    "--lines",
+    type=click.IntRange(1, 50),
+    default=5,
+    show_default=True,
+    help="Lines played on each draw.",
+)
+@click.option(
+    "--window",
+    type=click.IntRange(min=1),
+    default=50,
+    show_default=True,
+    help="Number of recent draws that define hot numbers.",
+)
+@click.option("--seed", type=int, help="Seed for a reproducible backtest.")
+@click.option(
+    "--static",
+    is_flag=True,
+    help="Suggest the lines once, from the training draws, and replay them on every draw.",
+)
+@click.option(
+    "--price",
+    type=click.FloatRange(min=0),
+    default=LINE_PRICE,
+    show_default=True,
+    help="Price of one line, in euros.",
+)
+@click.pass_obj
+def backtest_command(
+    cache_path: Path,
+    strategies: tuple[str, ...],
+    train_fraction: float,
+    lines: int,
+    window: int,
+    seed: int | None,
+    static: bool,
+    price: float,
+) -> None:
+    """Measure what the strategies would have won on draws they had not seen.
+
+    The oldest draws only serve to build statistics. Each remaining draw is then
+    played with lines suggested from the draws that precede it, and scored with
+    the prizes really paid that day.
+    """
+    draws = _load_draws(cache_path)
+    try:
+        report = backtest.backtest(
+            draws,
+            strategies or backtest.DEFAULT_STRATEGIES,
+            train_fraction=train_fraction,
+            lines=lines,
+            window=window,
+            seed=seed,
+            refresh=not static,
+            line_price=price,
+        )
+    except (ValueError, RuntimeError) as exc:
+        # E.g. an evaluation period that starts before the current rules.
+        raise click.ClickException(str(exc)) from exc
+    click.echo("\n".join(_render_backtest(report)))
+    click.echo()
+    click.echo(DISCLAIMER)
+
+
 @cli.command("next-draw")
 def next_draw() -> None:
     """Show when the next draw takes place."""
@@ -167,16 +258,20 @@ def _load_draws(cache_path: Path) -> list[Draw]:
     return draws
 
 
+def _count(number: int, noun: str) -> str:
+    """Return e.g. ``"1 draw"`` or ``"3 draws"``."""
+    return f"{number} {noun}{'' if number == 1 else 's'}"
+
+
 def _describe_draw(draw: Draw) -> str:
-    text = str(draw)
-    if draw.jackpot_winners is None:
-        return text
-    if draw.jackpot_winners == 0:
-        return f"{text} (jackpot not won)"
-    winners = f"{draw.jackpot_winners} winner{'s' if draw.jackpot_winners != 1 else ''}"
-    if not draw.jackpot_prize:
-        return f"{text} (jackpot won, {winners})"
-    return f"{text} (jackpot won, {winners}, EUR {draw.jackpot_prize:,.0f} each)"
+    """Describe a draw and, when its prizes are known, what became of the jackpot."""
+    jackpot = draw.jackpot
+    if jackpot is None:
+        return str(draw)
+    if not jackpot.prize:
+        return f"{draw} (jackpot not won)"
+    winners = _count(jackpot.winners, "winner")
+    return f"{draw} (jackpot won: {winners}, EUR {jackpot.prize:,.0f} each)"
 
 
 def _format_countdown(moment: dt.datetime, now: dt.datetime) -> str:
@@ -187,7 +282,7 @@ def _format_countdown(moment: dt.datetime, now: dt.datetime) -> str:
     days, rest = divmod(total_minutes, 24 * 60)
     hours, minutes = divmod(rest, 60)
     parts = [(days, "day"), (hours, "hour"), (minutes, "minute")]
-    shown = [f"{value} {unit}{'s' if value != 1 else ''}" for value, unit in parts if value]
+    shown = [_count(value, unit) for value, unit in parts if value]
     return "in " + " ".join(shown[:2]) if shown else "now"
 
 
@@ -220,22 +315,34 @@ def _render_number_rankings(
     window: int,
     top: int,
 ) -> list[str]:
+    # Ranked by z-score, i.e. against what each number could be expected to do: raw counts
+    # would be unfair to the stars that joined the pool later. Half of the pool at most, so
+    # that no number is listed as both most and least drawn.
     drawn = [s for s in stats.values() if s.eligible_draws]
-    by_frequency = sorted(drawn, key=lambda s: (-s.frequency, s.number))
-    least_frequent = sorted(drawn, key=lambda s: (s.frequency, s.number))
-    return [
+    most_drawn = sorted(drawn, key=lambda s: (-s.z_score, s.number))
+    least_drawn = most_drawn[::-1]
+    shown = min(top, len(drawn) // 2)
+    lines = [
         title,
-        _ranking(
-            "Most frequent", (f"{s.number} ({_percent(s.frequency)})" for s in by_frequency[:top])
-        ),
-        _ranking(
-            "Least frequent",
-            (f"{s.number} ({_percent(s.frequency)})" for s in least_frequent[:top]),
-        ),
+        _ranking("Most drawn", (f"{s.number} ({s.count}x)" for s in most_drawn[:shown])),
+        _ranking("Least drawn", (f"{s.number} ({s.count}x)" for s in least_drawn[:shown])),
         _ranking(f"Hot, last {window}", (f"{s.number} ({s.count}x)" for s in hot)),
         _ranking(f"Cold, last {window}", (f"{s.number} ({s.count}x)" for s in cold)),
-        _ranking("Most overdue", (f"{s.number} ({s.current_gap} draws)" for s in overdue)),
+        _ranking(
+            "Most overdue", (f"{s.number} ({_count(s.current_gap, 'draw')})" for s in overdue)
+        ),
     ]
+    if len({s.eligible_draws for s in drawn}) > 1:
+        lines.append(
+            textwrap.fill(
+                "Not all of them were in the pool for the whole period: each one is ranked "
+                "against the number of times it could be expected to come up.",
+                width=_WIDTH,
+                initial_indent="  ",
+                subsequent_indent="  ",
+            )
+        )
+    return lines
 
 
 def _render_distribution(label: str, distribution: Distribution) -> str:
@@ -323,4 +430,76 @@ def _render_number_table(title: str, stats: Iterable[NumberStats]) -> list[str]:
             f"{s.z_score:>+6.2f}  {average_gap:>7}  {s.current_gap:>7}  {s.longest_gap:>7}  "
             f"{last_seen}"
         )
+    return lines
+
+
+def _render_backtest(report: Backtest) -> list[str]:
+    source = (
+        f"the {_count(report.train_draws, 'draw')} from {report.train_start} to {report.train_end}"
+    )
+    method = (
+        f"suggested from all the draws before it: {source} at first, then every draw since"
+        if report.refresh
+        else f"suggested once from {source} and replayed unchanged"
+    )
+    first = report.results[0]
+    lines = [
+        textwrap.fill(
+            f"Backtest on {_count(report.test_draws, 'draw')} from {report.test_start} to "
+            f"{report.test_end}. Each strategy plays {_count(report.lines_per_draw, 'line')} "
+            f"per draw, {method}. That is {_count(first.lines, 'line')} for "
+            f"EUR {first.cost:,.2f} per strategy.",
+            width=_WIDTH,
+        ),
+        "",
+        f"{'Strategy':<9}{'Winnings':>12}{'Net':>13}{'ROI':>9}{'Wins':>7}  {'Numbers':<14}Stars",
+    ]
+    for result in report.results:
+        numbers = f"{result.main_matches_per_line:.3f} ({result.main_z:+.1f})"
+        stars = f"{result.star_matches_per_line:.3f} ({result.star_z:+.1f})"
+        lines.append(
+            f"{result.strategy:<9}{result.winnings:>12,.2f}{result.net:>13,.2f}"
+            f"{result.roi:>9.1%}{result.win_rate:>7.1%}  {numbers:<14}{stars}"
+        )
+    lines += [
+        f"{'by chance':<43}{backtest.WIN_PROBABILITY:>7.1%}  "
+        f"{backtest.EXPECTED_MATCHES['main']:<14.3f}{backtest.EXPECTED_MATCHES['star']:.3f}",
+        "",
+        textwrap.fill(
+            "Amounts are in euros; ROI is the net result over the cost. Wins is the share of "
+            "lines that won a prize. Numbers and Stars are the average matches per line, with "
+            "their z-score against pure chance in brackets: a strategy able to predict anything "
+            "would stand well beyond +/-2.",
+            width=_WIDTH,
+        ),
+    ]
+
+    wins = [(result.best_win, result.strategy) for result in report.results if result.best_win]
+    if wins:
+        best, strategy = max(wins, key=lambda win: win[0].amount)
+        main, stars_matched = _RANK_MATCHES[best.rank]
+        lines.append(
+            f"Biggest win: EUR {best.amount:,.2f} by {strategy} on {best.date} "
+            f"({_count(main, 'number')} + {_count(stars_matched, 'star')})."
+        )
+    estimated = sum(result.estimated_wins for result in report.results)
+    if estimated:
+        lines.append(
+            textwrap.fill(
+                f"{_count(estimated, 'win')} of a rank that nobody actually won that day: "
+                "valued at the average prize pool of the rank.",
+                width=_WIDTH,
+            )
+        )
+    if report.skipped_draws:
+        lines.append(
+            f"{_count(report.skipped_draws, 'draw')} without prize data could not be played."
+        )
+    lines.append(
+        textwrap.fill(
+            "The jackpot holds about half of the prize money, but is far too rare to show up "
+            "in a backtest: these figures essentially measure the small prizes.",
+            width=_WIDTH,
+        )
+    )
     return lines

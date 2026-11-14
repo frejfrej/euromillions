@@ -224,12 +224,8 @@ class _Strategy(NamedTuple):
 _STRATEGIES: dict[str, _Strategy] = {
     "hot": _Strategy("favour numbers drawn more often than expected in recent draws", _hot),
     "cold": _Strategy("favour overdue numbers, those not drawn for the longest time", _cold),
-    "balanced": _Strategy(
-        "mix hot and overdue numbers, keeping the usual odd/even and low/high splits", _balanced
-    ),
-    "weighted": _Strategy(
-        "weight numbers by overall frequency, overdue gap and pair affinity", _weighted
-    ),
+    "balanced": _Strategy("hot and overdue numbers, usual odd/even and low/high mix", _balanced),
+    "weighted": _Strategy("weight numbers by frequency, overdue gap and pair affinity", _weighted),
     "anti": _Strategy("uniformly random lines that avoid historically rare patterns", _anti),
 }
 

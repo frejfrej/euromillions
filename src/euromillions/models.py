@@ -8,6 +8,7 @@ pool grew over time (which matters when analysing the full draw history).
 from __future__ import annotations
 
 import datetime as dt
+import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -30,6 +31,31 @@ STAR_POOL_HISTORY: tuple[tuple[dt.date, int], ...] = (
     (dt.date(2011, 5, 10), 11),
     (dt.date(2016, 9, 27), 12),
 )
+
+#: First draw under the current rules: 12 Lucky Stars, the prize ranks below, EUR 2.50 a line.
+CURRENT_RULES_SINCE = STAR_POOL_HISTORY[-1][0]
+
+#: Prize rank won under the current rules, by (main numbers matched, Lucky Stars matched).
+#: Rank 1 is the jackpot; any other combination wins nothing.
+PRIZE_RANKS: dict[tuple[int, int], int] = {
+    (5, 2): 1,
+    (5, 1): 2,
+    (5, 0): 3,
+    (4, 2): 4,
+    (4, 1): 5,
+    (3, 2): 6,
+    (4, 0): 7,
+    (2, 2): 8,
+    (3, 1): 9,
+    (3, 0): 10,
+    (1, 2): 11,
+    (2, 1): 12,
+    (2, 0): 13,
+}
+
+#: Price of one line in France, in euros. EUR 2.20 of it funds the draw itself and
+#: EUR 0.30 the "My Million" raffle that comes with every line.
+LINE_PRICE = 2.5
 
 #: The two kinds of balls in a draw.
 BallKind = Literal["main", "star"]
@@ -79,21 +105,49 @@ def _normalise(values: Iterable[int], *, count: int, maximum: int, label: str) -
     return tuple(sorted(picked))
 
 
+def _is_number(value: object) -> bool:
+    """Tell whether ``value`` is a finite, non-negative real number (and not a bool)."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PrizeTier:
+    """What one prize rank paid in a draw.
+
+    ``winners`` counts the winning lines across Europe and ``prize`` is the
+    amount each of them received, in euros (0 when nobody won that rank).
+    """
+
+    winners: int
+    prize: float
+
+    def __post_init__(self) -> None:
+        if not _is_number(self.winners) or not isinstance(self.winners, int):
+            raise ValueError(f"winners must be a non-negative integer, got {self.winners!r}")
+        if not _is_number(self.prize):
+            raise ValueError(f"prize must be a non-negative number, got {self.prize!r}")
+        object.__setattr__(self, "prize", float(self.prize))
+
+
 @dataclass(frozen=True, slots=True)
 class Draw:
     """One historical EuroMillions draw.
 
     ``numbers`` and ``stars`` are validated against the rules in force on
-    ``date`` and stored in ascending order. The optional jackpot fields
-    describe the top prize rank: how many tickets won it across Europe and
-    how much each of them received, in euros.
+    ``date`` and stored in ascending order. ``prizes`` lists every prize rank
+    of the draw, best first (index 0 is rank 1, the jackpot), as the ranks
+    were numbered at the time; it is empty when the prizes are unknown.
     """
 
     date: dt.date
     numbers: tuple[int, ...]
     stars: tuple[int, ...]
-    jackpot_winners: int | None = None
-    jackpot_prize: float | None = None
+    prizes: tuple[PrizeTier, ...] = ()
 
     def __post_init__(self) -> None:
         # datetime is a subclass of date but does not compare with plain dates.
@@ -109,19 +163,18 @@ class Draw:
         object.__setattr__(self, "numbers", numbers)
         object.__setattr__(self, "stars", stars)
 
-        winners = self.jackpot_winners
-        if winners is not None and (
-            not isinstance(winners, int) or isinstance(winners, bool) or winners < 0
-        ):
-            raise ValueError(f"jackpot_winners must be a non-negative integer, got {winners!r}")
-        prize = self.jackpot_prize
-        if prize is not None:
-            if not isinstance(prize, (int, float)) or isinstance(prize, bool) or not prize >= 0:
-                raise ValueError(f"jackpot_prize must be a non-negative number, got {prize!r}")
-            object.__setattr__(self, "jackpot_prize", float(prize))
+        prizes = tuple(self.prizes)
+        if not all(isinstance(tier, PrizeTier) for tier in prizes):
+            raise ValueError(f"prizes must be PrizeTier objects, got {prizes!r}")
+        object.__setattr__(self, "prizes", prizes)
 
     def __str__(self) -> str:
         return f"{self.date.isoformat()}: {format_line(self.numbers, self.stars)}"
+
+    @property
+    def jackpot(self) -> PrizeTier | None:
+        """The top prize rank of the draw, or ``None`` when its prizes are unknown."""
+        return self.prizes[0] if self.prizes else None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable representation (inverse of :meth:`from_dict`)."""
@@ -130,10 +183,8 @@ class Draw:
             "numbers": list(self.numbers),
             "stars": list(self.stars),
         }
-        if self.jackpot_winners is not None:
-            data["jackpot_winners"] = self.jackpot_winners
-        if self.jackpot_prize is not None:
-            data["jackpot_prize"] = self.jackpot_prize
+        if self.prizes:
+            data["prizes"] = [[tier.winners, tier.prize] for tier in self.prizes]
         return data
 
     @classmethod
@@ -148,8 +199,9 @@ class Draw:
                 date=dt.date.fromisoformat(data["date"]),
                 numbers=tuple(data["numbers"]),
                 stars=tuple(data["stars"]),
-                jackpot_winners=data.get("jackpot_winners"),
-                jackpot_prize=data.get("jackpot_prize"),
+                prizes=tuple(
+                    PrizeTier(winners, prize) for winners, prize in data.get("prizes", ())
+                ),
             )
         except (KeyError, TypeError, AttributeError) as exc:
             raise ValueError(f"malformed draw record: {data!r}") from exc
