@@ -94,7 +94,13 @@ class TestFetch:
     @pytest.fixture
     def update(self, monkeypatch: pytest.MonkeyPatch, history: list[Draw]) -> dict[str, object]:
         """Replace the network update by a stub; returns the dict that configures it."""
-        config: dict[str, object] = {"added": 0, "downloaded": True, "error": None, "calls": []}
+        config: dict[str, object] = {
+            "added": 0,
+            "updated": 0,
+            "downloaded": True,
+            "error": None,
+            "calls": [],
+        }
 
         def fake_update_cache(path: Path, *, force: bool = False) -> fetcher.UpdateResult:
             assert isinstance(config["calls"], list)
@@ -102,7 +108,10 @@ class TestFetch:
             if isinstance(config["error"], Exception):
                 raise config["error"]
             assert isinstance(config["added"], int)
-            return fetcher.UpdateResult(history, config["added"], bool(config["downloaded"]))
+            assert isinstance(config["updated"], int)
+            return fetcher.UpdateResult(
+                history, config["added"], config["updated"], bool(config["downloaded"])
+            )
 
         monkeypatch.setattr(fetcher, "update_cache", fake_update_cache)
         return config
@@ -123,28 +132,78 @@ class TestFetch:
         update["added"] = 1
         assert "Added 1 new draw." in run("fetch", data_dir=tmp_path).output
 
+    def test_updated_draws(self, update: dict[str, object], tmp_path: Path) -> None:
+        # E.g. the prizes of the latest draw, published after its numbers.
+        update["updated"] = 1
+        assert "Updated 1 draw." in run("fetch", data_dir=tmp_path).output
+        update["added"] = 2
+        assert "Added 2 new draws, updated 1 draw." in run("fetch", data_dir=tmp_path).output
+
     def test_nothing_new(self, update: dict[str, object], tmp_path: Path) -> None:
-        assert "No new draw has been published yet." in run("fetch", data_dir=tmp_path).output
+        output = run("fetch", data_dir=tmp_path).output
+        assert "Nothing new at the source." in output
+        # The history of the stub ends in 2019: the latest draw is missing from it.
+        assert re.search(
+            r"^The draw of \d{4}-\d\d-\d\d has not been published yet\.$", output, re.M
+        )
+
+    def test_latest_draw_already_there(
+        self,
+        update: dict[str, object],
+        tmp_path: Path,
+        history: list[Draw],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        latest = schedule.draw_datetime(history[-1].date)
+        monkeypatch.setattr(schedule, "previous_draw", lambda now=None: latest)
+        output = run("fetch", "--force", data_dir=tmp_path).output
+        assert "Nothing new at the source." in output
+        assert "has not been published yet" not in output
 
     def test_already_up_to_date(self, update: dict[str, object], tmp_path: Path) -> None:
         update["downloaded"] = False
-        assert "Already up to date." in run("fetch", data_dir=tmp_path).output
+        output = run("fetch", data_dir=tmp_path).output
+        assert "Already up to date." in output
+        assert "has not been published yet" not in output
 
     def test_force_is_passed_on(self, update: dict[str, object], tmp_path: Path) -> None:
         assert run("fetch", "--force", data_dir=tmp_path).exit_code == 0
         assert update["calls"] == [(tmp_path / fetcher.CACHE_FILENAME, True)]
 
     @pytest.mark.parametrize(
-        "error", [fetcher.FetchError("download failed"), fetcher.CacheError("cache is corrupt")]
+        ("error", "hint"),
+        [
+            (fetcher.FetchError("download failed"), False),
+            (fetcher.CacheError("cannot write the cache"), False),
+            (fetcher.CorruptCacheError("the cache is not valid JSON"), True),
+        ],
     )
     def test_errors_are_reported_cleanly(
-        self, error: Exception, update: dict[str, object], tmp_path: Path
+        self, error: Exception, hint: bool, update: dict[str, object], tmp_path: Path
     ) -> None:
         update["error"] = error
         result = run("fetch", data_dir=tmp_path)
         assert result.exit_code == 1
         assert f"Error: {error}" in result.output
         assert "Traceback" not in result.output
+        # Deleting the file only helps when its content is the problem.
+        assert ("Delete that file" in result.output) is hint
+
+    def test_a_cache_that_cannot_be_written_is_reported_cleanly(
+        self, tmp_path: Path, history: list[Draw], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def disk_full(source: object, target: object) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(fetcher, "fetch_draws", lambda session=None, now=None: history)
+        monkeypatch.setattr(fetcher.os, "replace", disk_full)
+        result = run("fetch", data_dir=tmp_path)
+        assert result.exit_code == 1
+        assert "Error: cannot write the draw cache" in result.output
+        assert "disk full" in result.output
+        assert "Delete that file" not in result.output
+        assert "Traceback" not in result.output
+        assert list(tmp_path.iterdir()) == []
 
 
 class TestAnalyze:
@@ -180,12 +239,43 @@ class TestAnalyze:
     def test_no_number_is_both_most_and_least_drawn(self, data_dir: Path) -> None:
         result = run("analyze", "--top", "40", data_dir=data_dir)
         stars = result.output.split("LUCKY STARS")[1].split("COMBINATIONS")[0]
-        most, least = (
-            re.findall(r"(\d+) \(", stars.split(label)[1].split("\n  ")[0])
-            for label in ("Most drawn", "Least drawn")
-        )
+        most = re.findall(r"(\d+) \(\d+x", stars.split("Most drawn")[1].split("Least drawn")[0])
+        least = re.findall(r"(\d+) \(\d+x", stars.split("Least drawn")[1].split("Hot, last")[0])
         assert len(most) == len(least) == 6
         assert not set(most) & set(least)
+
+    def test_extremes_come_with_what_chance_alone_produces(self, data_dir: Path) -> None:
+        output = " ".join(run("analyze", data_dir=data_dir).output.split())
+        # Every number is listed with its count and z-score...
+        assert re.search(r"Most drawn \d+ \(\d+x, \+\d\.\d\)", output)
+        assert re.search(r"Least drawn \d+ \(\d+x, -\d\.\d\)", output)
+        # ... and each block says how far fair draws go.
+        assert "the most extreme of 50 z-scores near +/-2.5" in output
+        assert "the longest current absence near 40 draws" in output
+        assert "the most extreme of 12 z-scores near +/-1.9" in output
+        assert "the longest current absence near 15 draws" in output
+        assert re.search(
+            r"By chance a given pair is expected 2\.4 times and the luckiest one about \d+; "
+            r"a triplet 0\.2 and \d; a star pair 4\.5 and \d+ ",
+            output,
+        )
+
+    def test_rankings_cut_inside_a_tie_say_so(self, data_dir: Path) -> None:
+        # More triplets came up as often as the last one listed than the ranking can show.
+        output = run("analyze", data_dir=data_dir).output
+        triplets = output.split("Top triplets")[1].split("Top star pairs")[0]
+        assert re.search(r"\((\d+)x\)  \+\d+ more at \1x\n", triplets)
+
+    def test_spread_is_given_with_its_real_share_of_the_draws(self, data_dir: Path) -> None:
+        output = run("analyze", data_dir=data_dir).output
+        shares = [int(share) for share in re.findall(r"(\d+)% of draws between", output)]
+        assert len(shares) == 2
+        assert all(80 <= share <= 90 for share in shares)
+
+    def test_a_single_draw(self, data_dir: Path) -> None:
+        result = run("analyze", "--last", "1", data_dir=data_dir)
+        assert result.exit_code == 0
+        assert "EuroMillions analysis: 1 draw from" in result.output
 
     def test_stars_that_joined_later_are_explained(
         self, tmp_path: Path, make_history: HistoryFactory
@@ -311,9 +401,59 @@ class TestBacktest:
             winnings, net, roi = (float(cell.replace(",", "").rstrip("%")) for cell in row[1:4])
             assert net == pytest.approx(winnings - 1000.0, abs=0.011)
             assert roi == pytest.approx(net / 10.0, abs=0.051)
-        assert re.search(r"^by chance +7\.7%  0\.500 +0\.333$", result.output, re.MULTILINE)
+        # The yardstick: what random lines are expected to win, and how much that varies.
+        chance = re.search(
+            r"^by chance +([\d.]+) +(-[\d.]+) +(-[\d.]+)% +7\.7%  0\.500 +0\.333$",
+            result.output,
+            re.MULTILINE,
+        )
+        assert chance
+        winnings, net, roi = map(float, chance.groups())
+        assert winnings == pytest.approx(183.63, abs=0.006)  # 400 lines at EUR 0.459 each
+        assert net == pytest.approx(winnings - 1000.0, abs=0.011)
+        assert roi == pytest.approx(net / 10.0, abs=0.051)
+        spread = re.search(
+            r"^\+/- 1 SD +([\d.]+) +([\d.]+) +(\d+\.\d)% +1\.3%$", result.output, re.MULTILINE
+        )
+        assert spread
+        assert (
+            float(spread[1]) == float(spread[2]) == pytest.approx(float(spread[3]) * 10, abs=0.51)
+        )
         assert DISCLAIMER in result.output
         assert max(len(line) for line in result.output.splitlines()) <= 80
+
+    def test_explains_how_to_read_the_figures(self, paid_dir: Path) -> None:
+        output = " ".join(run("backtest", "--seed", "1", data_dir=paid_dir).output.split())
+        # Twelve z-scores on screen: one beyond 2 is nothing unusual.
+        assert "beyond +/-2 about once in 22: with 12 of them here" in output
+        assert "at least one in about 43% of backtests" in output
+        assert "Only a value beyond about +/-2.9" in output
+        assert "from prize ranks 4 to 13" in output
+        assert "The 3 top ranks, jackpot included, hold about half of the prize money" in output
+        assert "EUR 0.30 per line for the My Million raffle, which is not simulated" in output
+        assert "With fewer than 1000 lines per strategy, luck dominates these figures." in output
+        two = " ".join(
+            run("backtest", "--strategy", "hot", "--seed", "1", data_dir=paid_dir).output.split()
+        )
+        assert "with 2 of them here, at least one in about 9% of backtests" in two
+        assert "Only a value beyond about +/-2.2" in two
+
+    def test_enough_lines_and_another_price_drop_the_notes_that_do_not_apply(
+        self, paid_dir: Path
+    ) -> None:
+        arguments = ("--strategy", "random", "--lines", "13", "--price", "2.2", "--seed", "1")
+        output = " ".join(run("backtest", *arguments, data_dir=paid_dir).output.split())
+        assert "1040 lines for EUR 2,288.00 per strategy" in output
+        assert "luck dominates" not in output
+        assert "My Million" not in output
+
+    def test_a_cell_too_wide_for_its_column_does_not_touch_its_neighbour(
+        self, paid_dir: Path
+    ) -> None:
+        arguments = ("--strategy", "hot", "--lines", "50", "--price", "99999.99", "--seed", "1")
+        output = run("backtest", *arguments, data_dir=paid_dir).output
+        (row,) = (line for line in output.splitlines() if line.startswith("hot "))
+        assert re.fullmatch(r"hot +[\d,.]+ -[\d,.]+ +-100\.0% +\d+\.\d% .*", row)
 
     def test_seed_makes_the_output_reproducible(self, paid_dir: Path) -> None:
         first = run("backtest", "--seed", "4", "--strategy", "hot", data_dir=paid_dir).output
@@ -358,7 +498,7 @@ class TestBacktest:
     def test_reports_the_biggest_win(self, paid_dir: Path) -> None:
         result = run("backtest", "--seed", "1", data_dir=paid_dir)
         assert re.search(
-            r"^Biggest win: EUR [\d,]+\.\d\d by \w+ on \d{4}-\d\d-\d\d "
+            r"^- Biggest win: EUR [\d,]+\.\d\d by \w+ on \d{4}-\d\d-\d\d "
             r"\(\d numbers? \+ \d stars?\)\.$",
             result.output,
             re.MULTILINE,
@@ -400,10 +540,18 @@ class TestBacktest:
             ("--lines", "0"),
             ("--window", "0"),
             ("--price", "-1"),
+            ("--price", "0"),
         ],
     )
     def test_rejects_invalid_options(self, arguments: tuple[str, ...], data_dir: Path) -> None:
         assert run("backtest", *arguments, data_dir=data_dir).exit_code == 2
+
+    @pytest.mark.parametrize("price", ["nan", "inf"])
+    def test_rejects_a_price_that_is_not_an_amount(self, price: str, paid_dir: Path) -> None:
+        result = run("backtest", "--price", price, data_dir=paid_dir)
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+        assert "nan%" not in result.output
 
 
 class TestNextDraw:

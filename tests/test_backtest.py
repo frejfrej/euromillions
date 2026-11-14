@@ -154,16 +154,41 @@ class TestScoring:
         assert result.best_win is not None
         assert result.best_win.rank == 6  # the jackpot hit is worth nothing here
 
+    def test_an_unclaimed_rank_is_valued_from_earlier_draws_only(
+        self, scenario: list[Draw], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A jackpot hit on the first evaluated draw, where nobody won it. Jackpots were won
+        # two draws earlier (2 x 30M) and three draws later (1 x 90M): only the former was
+        # known at the time.
+        monkeypatch.setattr(suggester, "suggest", SuggestSpy([LINE_A]))
+        earlier_win = (PrizeTier(2, 30_000_000.0), *TYPICAL_PRIZES[1:])
+        later_win = (PrizeTier(1, 90_000_000.0), *TYPICAL_PRIZES[1:])
+        dates = [draw.date for draw in scenario]
+        history = [
+            Draw(dates[0], (11, 21, 31, 41, 49), (7, 8), TYPICAL_PRIZES),
+            Draw(dates[1], (11, 21, 31, 41, 49), (7, 8), earlier_win),
+            Draw(dates[2], (11, 21, 31, 41, 49), (7, 8), TYPICAL_PRIZES),
+            Draw(dates[3], (1, 2, 3, 4, 5), (1, 2), TYPICAL_PRIZES),
+            Draw(dates[4], (11, 21, 31, 41, 49), (7, 8), TYPICAL_PRIZES),
+            Draw(dates[5], (11, 21, 31, 41, 49), (7, 8), TYPICAL_PRIZES),
+            Draw(dates[6], (11, 21, 31, 41, 49), (7, 8), later_win),
+        ]
+        (result,) = backtest(history, ["hot"], train_fraction=0.43, lines=1).results
+        assert result.wins_by_rank[1] == 1
+        assert result.estimated_wins == 1
+        assert result.winnings == pytest.approx(60_000_000.0)
+
     def test_a_published_prize_without_winner_count_is_paid_as_is(
         self, scenario: list[Draw], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # The source has a few draws where the European winner counts are all zero.
+        # The source has a few draws where the European winner counts are all zero: the
+        # amount cannot be shared with winners nobody counted, and is flagged as an estimate.
         monkeypatch.setattr(suggester, "suggest", SuggestSpy([LINE_B]))
         no_counts = tuple(PrizeTier(0, tier.prize) for tier in TYPICAL_PRIZES)
         patched = [*scenario[:-1], Draw(scenario[-1].date, (1, 2, 3, 4, 5), (1, 2), no_counts)]
         (result,) = backtest(patched, ["hot"], train_fraction=0.6, lines=1, refresh=False).results
         assert result.best_win == Win(scenario[-1].date, 5, pytest.approx(131.50))
-        assert result.estimated_wins == 0
+        assert result.estimated_wins == 1
 
     def test_line_price(self, scenario: list[Draw], monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(suggester, "suggest", SuggestSpy([LINE_A, LINE_B]))
@@ -171,12 +196,28 @@ class TestScoring:
         assert report.line_price == 2.2
         assert report.results[0].cost == pytest.approx(6 * 2.2)
 
-    def test_a_free_game_has_no_return_on_investment(
-        self, scenario: list[Draw], monkeypatch: pytest.MonkeyPatch
+    def test_random_lines_are_the_yardstick_for_winnings(self, paid_history: list[Draw]) -> None:
+        report = backtest(paid_history[:100], [RANDOM], lines=4, seed=1)
+        # 20 draws x 4 lines, all paying TYPICAL_PRIZES. Ranks 4 to 13, with the number of
+        # winning lines out of C(50,5) x C(12,2) = 139,838,160, each prize being shared with
+        # one more winner.
+        ways = [225, 4_500, 9_900, 10_125, 141_900, 198_000, 445_500, 744_975, 2_838_000, 6_385_500]
+        chances = [way / 139_838_160 for way in ways]
+        amounts = [tier.prize * tier.winners / (tier.winners + 1) for tier in TYPICAL_PRIZES[3:]]
+        mean = sum(chance * amount for chance, amount in zip(chances, amounts, strict=True))
+        square = sum(chance * amount**2 for chance, amount in zip(chances, amounts, strict=True))
+        assert report.chance_winnings == pytest.approx(80 * mean)
+        assert report.chance_winnings_sd == pytest.approx(math.sqrt(80 * (square - mean**2)))
+        # Under half a euro for a line that costs EUR 2.50.
+        assert report.chance_winnings / 80 == pytest.approx(0.46, abs=0.01)
+
+    def test_the_yardstick_does_not_depend_on_the_strategies_played(
+        self, paid_history: list[Draw]
     ) -> None:
-        monkeypatch.setattr(suggester, "suggest", SuggestSpy([LINE_A]))
-        report = backtest(scenario, ["hot"], train_fraction=0.6, lines=1, line_price=0)
-        assert report.results[0].roi == 0.0
+        one = backtest(paid_history[:100], ["hot"], seed=1)
+        other = backtest(paid_history[:100], ["cold", RANDOM], seed=2, refresh=False)
+        assert one.chance_winnings == other.chance_winnings
+        assert one.chance_winnings_sd == other.chance_winnings_sd
 
 
 class TestSplit:
@@ -333,7 +374,14 @@ class TestValidation:
             backtest(paid_history, train_fraction=fraction)
 
     @pytest.mark.parametrize(
-        ("option", "value"), [("lines", 0), ("window", 0), ("line_price", -1.0)]
+        ("option", "value"),
+        [
+            ("lines", 0),
+            ("window", 0),
+            ("line_price", -1.0),
+            ("line_price", 0),  # a return on investment needs a cost
+            ("line_price", float("nan")),
+        ],
     )
     def test_numeric_options(self, option: str, value: float, paid_history: list[Draw]) -> None:
         with pytest.raises(ValueError, match=option):
@@ -357,9 +405,64 @@ class TestValidation:
         # The suggested fraction is rounded up, so that it is always enough.
         assert backtest(history, [RANDOM], train_fraction=0.607, seed=1).test_draws == 39
 
+    def test_the_suggested_fraction_stays_below_one(self) -> None:
+        # 1,999 draws before the current rules and a single one under them.
+        first = dt.date(2010, 1, 1)
+        history = [
+            Draw(first + dt.timedelta(days=day), (1, 2, 3, 4, 5), (1, 2), TYPICAL_PRIZES)
+            for day in range(1999)
+        ]
+        history.append(Draw(dt.date(2016, 9, 27), (1, 2, 3, 4, 5), (1, 2), TYPICAL_PRIZES))
+        with pytest.raises(ValueError, match=r"at least 0\.9995$"):
+            backtest(history, [RANDOM], train_fraction=0.9)
+        assert backtest(history, [RANDOM], train_fraction=0.9995, seed=1).test_draws == 1
+
+    @pytest.mark.parametrize(
+        ("fraction", "expected"),
+        [
+            (0.6, "0.600"),
+            (60 / 99, "0.607"),
+            (940 / 1998, "0.471"),
+            (0.9991, "0.9991"),
+            (1999 / 2000, "0.9995"),
+            (0.99999, "0.99999"),
+        ],
+    )
+    def test_fractions_are_rounded_up_to_the_fewest_decimals_that_stay_below_one(
+        self, fraction: float, expected: str
+    ) -> None:
+        assert backtest_module._round_up(fraction) == expected
+
+    def test_a_history_entirely_before_the_current_rules_cannot_be_evaluated(self) -> None:
+        history = random_history(50, start=dt.date(2012, 1, 3), prizes=TYPICAL_PRIZES)
+        with pytest.raises(ValueError, match="nothing to evaluate"):
+            backtest(history, [RANDOM])
+
     def test_evaluated_draws_need_prize_data(self, history: list[Draw]) -> None:
         with pytest.raises(ValueError, match="prize data"):
             backtest(history, [RANDOM])
+
+    def test_draws_without_usable_prizes_are_skipped_but_still_seen(
+        self, paid_history: list[Draw], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        history = paid_history[:10]
+        unknown = Draw(history[8].date, history[8].numbers, history[8].stars)
+        # A rank won at every draw cannot pay nothing: that is a gap in the data.
+        gap = (*TYPICAL_PRIZES[:12], PrizeTier(0, 0.0))
+        gapped = Draw(history[7].date, history[7].numbers, history[7].stars, gap)
+        history = [*history[:7], gapped, unknown, history[9]]
+        spy = SuggestSpy([LINE_A])
+        monkeypatch.setattr(suggester, "suggest", spy)
+        report = backtest(history, ["hot"], train_fraction=0.6, lines=1)
+        assert (report.train_draws, report.test_draws, report.skipped_draws) == (6, 2, 2)
+        assert (report.test_start, report.test_end) == (history[6].date, history[9].date)
+        assert report.results[0].lines == 2
+        # The skipped draws are part of what the strategy knows when the last one is played.
+        assert spy.calls == [history[:6], history[:9]]
+
+    def test_an_unclaimed_top_rank_is_not_a_gap(self, paid_history: list[Draw]) -> None:
+        # TYPICAL_PRIZES has no jackpot winner: every draw is evaluated all the same.
+        assert backtest(paid_history[:50], [RANDOM], seed=1).skipped_draws == 0
 
     def test_training_draws_do_not_need_prize_data(
         self, history: list[Draw], paid_history: list[Draw]

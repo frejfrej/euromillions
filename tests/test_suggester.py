@@ -9,6 +9,7 @@ from collections.abc import Callable, Iterable
 import pytest
 
 from euromillions import analyzer
+from euromillions import suggester as suggester_module
 from euromillions.models import Draw, Suggestion
 from euromillions.suggester import (
     STRATEGIES,
@@ -187,6 +188,25 @@ class TestStrategyBehaviour:
         for line in suggest(history, "balanced", lines=200, seed=5):
             assert sum(n % 2 for n in line.numbers) in typical_odd
             assert sum(n <= 25 for n in line.numbers) in typical_low
+
+    def test_balanced_drops_the_usual_splits_when_they_are_out_of_reach(
+        self, history: list[Draw], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(suggester_module, "_MAX_ATTEMPTS", 50)
+        dates = [draw.date for draw in history[:5]]
+        # Most of these draws have no odd number or a single one, but the last, hence
+        # the only hot numbers of a one-draw window, are all odd.
+        lopsided = [
+            Draw(dates[0], (2, 4, 6, 8, 10), (1, 2)),
+            Draw(dates[1], (12, 14, 16, 18, 20), (1, 2)),
+            Draw(dates[2], (22, 24, 26, 28, 30), (1, 2)),
+            Draw(dates[3], (1, 32, 34, 36, 38), (1, 2)),
+            Draw(dates[4], (41, 43, 45, 47, 49), (1, 2)),
+        ]
+        lines = suggest(lopsided, "balanced", lines=3, window=1, seed=1)
+        assert len(lines) == 3
+        # Two or three numbers of each line are hot: none can have a usual odd/even split.
+        assert all(sum(n % 2 for n in line.numbers) >= 2 for line in lines)
 
     def test_weighted_favours_frequent_and_overdue_numbers(self, history: list[Draw]) -> None:
         # 7 is in every one of the first 200 draws, then absent for 100: both its

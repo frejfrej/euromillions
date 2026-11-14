@@ -9,10 +9,12 @@ description = "EuroMillions number analyzer and suggestion tool"
 requires-python = ">=3.10"
 dependencies = [
     "requests>=2.31",
-    "urllib3>=1.26",
+    # Older urllib3 does not notice a response cut short of its announced length.
+    "urllib3>=2.0",
     "beautifulsoup4>=4.12",
     "click>=8.1",
-    "tzdata; sys_platform == 'win32'",
+    # Time zone data for Europe/Paris: not every system ships it.
+    "tzdata",
 ]
 
 [project.optional-dependencies]

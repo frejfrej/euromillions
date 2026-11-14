@@ -39,7 +39,7 @@ _MIN_PATTERN_HISTORY = 20
 _BASE_WEIGHT = 0.1
 
 #: Candidate lines tried before giving up on the pattern constraints of a strategy.
-_MAX_ATTEMPTS = 10_000
+_MAX_ATTEMPTS = 1_000
 
 _KINDS: tuple[BallKind, BallKind] = ("main", "star")
 
@@ -155,8 +155,8 @@ def _balanced(draws: list[Draw], window: int) -> _Generator:
                 and analyzer.low_count(numbers) in typical_low
             ):
                 break
-        else:
-            raise RuntimeError("no line matches the usual odd/even and low/high splits")
+        # If nothing fitted, the history is so short or lopsided that its hot and overdue
+        # numbers cannot form a line with its usual splits: the last candidate is kept.
         stars = _weighted_sample(rng, hot["star"], STAR_COUNT // 2)
         stars += _weighted_sample(rng, cold["star"], STAR_COUNT - len(stars), exclude=stars)
         return numbers, stars
@@ -251,7 +251,8 @@ def suggest(
     * ``cold`` does the same with the number of draws since each number last came up.
     * ``balanced`` takes about half of each line from the hot ranking and the rest
       from the cold one, and only keeps lines whose odd/even and low/high splits
-      are among the two most common in the history.
+      are among the two most common in the history (unless no such line turns up,
+      which only happens with a handful of draws).
     * ``weighted`` picks numbers one at a time with a weight combining their overall
       frequency (z-score), their current gap and how often they were drawn together
       with the numbers already picked.

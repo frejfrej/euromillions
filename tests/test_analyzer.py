@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 import random
+import statistics
 from collections import Counter
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -21,6 +22,7 @@ from euromillions.analyzer import (
     ConsecutiveStats,
     Distribution,
     NumberStats,
+    Ranking,
     analyze,
     cold_numbers,
     consecutive_pairs,
@@ -38,6 +40,9 @@ from euromillions.analyzer import (
     recent,
     sum_distribution,
     triplet_counts,
+    typical_extreme_z,
+    typical_longest_gap,
+    typical_top_count,
 )
 from euromillions.models import BallKind, Draw
 
@@ -59,6 +64,9 @@ def assert_stats(actual: NumberStats, **expected: Any) -> None:
     """Check the given fields of ``actual``, floats to within rounding errors."""
     assert {name: getattr(actual, name) for name in expected} == pytest.approx(expected)
 
+
+#: (kind, pool size, chance of being absent from a draw, median of the longest current gap).
+MEDIAN_GAPS = [("main", 50, 45 / 50, 40), ("star", 12, 10 / 12, 15)]
 
 #: Six draws under the current rules (12 stars), called positions 0 to 5 in the comments.
 HISTORY = (
@@ -580,6 +588,14 @@ class TestCombinations:
             {(1, 2): 2, (3, 4): 1, (1, 5): 1, (2, 12): 1, (2, 3): 1}
         )
 
+    def test_star_pairs_only_count_the_draws_held_with_todays_pool(self) -> None:
+        # With 9 or 11 stars in the pool, a pair of old stars was more likely than today and a
+        # pair with star 12 impossible: those draws would make the counts incomparable.
+        assert pair_counts(ERAS, "star") == Counter({(5, 12): 1, (1, 2): 1, (10, 12): 1})
+        assert pair_counts(ERAS[:2], "star") == Counter()
+        # Main numbers have always been drawn from the same pool.
+        assert sum(pair_counts(ERAS).values()) == 5 * 10
+
     def test_triplet_counts(self) -> None:
         triplets = triplet_counts(HISTORY)
         assert triplets[7, 21, 35] == 2  # positions 1 and 5
@@ -748,9 +764,23 @@ class TestAnalyze:
         assert numbers_of(report.overdue_numbers) == [4, 6, 16]
         assert numbers_of(report.overdue_stars) == [6, 7, 8]
         # Most frequent first, then in ascending order.
-        assert report.top_pairs == [((7, 21), 3), ((7, 35), 2), ((21, 35), 2)]
-        assert report.top_triplets == [((7, 21, 35), 2), ((1, 2, 3), 1), ((1, 2, 9), 1)]
-        assert report.top_star_pairs == [((1, 2), 2), ((1, 5), 1), ((2, 3), 1)]
+        assert report.top_pairs.entries == [((7, 21), 3), ((7, 35), 2), ((21, 35), 2)]
+        assert report.top_triplets.entries == [
+            ((7, 21, 35), 2),
+            ((1, 2, 3), 1),
+            ((1, 2, 9), 1),
+        ]
+        assert report.top_star_pairs.entries == [((1, 2), 2), ((1, 5), 1), ((2, 3), 1)]
+        # Combinations as frequent as the last one listed, but left out: no other pair came
+        # up twice, 56 other triplets and 2 other star pairs came up once.
+        assert report.top_pairs.more == 0
+        assert report.top_triplets.more == 56
+        assert report.top_star_pairs.more == 2
+        # A given pair is in a draw with probability C(5,2)/C(50,2), a triplet C(5,3)/C(50,3),
+        # a star pair 1/C(12,2).
+        assert report.top_pairs.expected == pytest.approx(6 * 10 / 1225)
+        assert report.top_triplets.expected == pytest.approx(6 * 10 / 19600)
+        assert report.top_star_pairs.expected == pytest.approx(6 / 66)
         assert report.consecutive.draws_with_consecutive == 4
         assert report.sums.values == (35, 95, 105, 125, 126, 131)
         assert report.ranges.values == (19, 28, 39, 40, 41, 43)
@@ -767,7 +797,8 @@ class TestAnalyze:
         rankings = (
             *(report.hot_numbers, report.cold_numbers, report.overdue_numbers),
             *(report.hot_stars, report.cold_stars, report.overdue_stars),
-            *(report.top_pairs, report.top_triplets, report.top_star_pairs),
+            *(report.top_pairs.entries, report.top_triplets.entries),
+            report.top_star_pairs.entries,
         )
         assert [len(ranking) for ranking in rankings] == [4] * 9
 
@@ -790,12 +821,16 @@ class TestAnalyze:
         assert report.ranges == range_distribution(SYNTHETIC)
         assert report.odd_counts == odd_count_distribution(SYNTHETIC)
         assert report.low_counts == low_count_distribution(SYNTHETIC)
-        for ranking, counts in (
+        for ranked, counts in (
             (report.top_pairs, pair_counts(SYNTHETIC)),
             (report.top_triplets, triplet_counts(SYNTHETIC)),
             (report.top_star_pairs, pair_counts(SYNTHETIC, "star")),
         ):
+            ranking = ranked.entries
             assert len(ranking) == 7
+            assert ranked.more == sum(count == ranking[-1][1] for count in counts.values()) - sum(
+                count == ranking[-1][1] for _, count in ranking
+            )
             assert all(counts[combination] == count for combination, count in ranking)
             # Sorted by decreasing count, then ascending combination...
             assert ranking == sorted(ranking, key=lambda item: (-item[1], item[0]))
@@ -911,7 +946,10 @@ class TestSyntheticHistory:
         assert sum(report.consecutive.longest_run_distribution.values()) == 300
         assert sum(pair_counts(SYNTHETIC).values()) == 10 * 300
         assert sum(triplet_counts(SYNTHETIC).values()) == 10 * 300
-        assert sum(pair_counts(SYNTHETIC, "star").values()) == 300
+        # Star pairs are only counted in the 100 draws held with twelve stars.
+        assert sum(pair_counts(SYNTHETIC, "star").values()) == 100
+        assert report.top_pairs.expected == pytest.approx(300 * 10 / 1225)
+        assert report.top_star_pairs.expected == pytest.approx(100 / 66)
 
     def test_measures_stay_within_their_bounds(self) -> None:
         report = analyze(SYNTHETIC)
@@ -933,3 +971,73 @@ class TestSyntheticHistory:
             assert [e.z_score for e in cold] == sorted(e.z_score for e in cold)
             assert not set(numbers_of(hot)) & set(numbers_of(cold))
             assert {entry.eligible_draws for entry in hot + cold} == {60}
+
+
+class TestChanceYardsticks:
+    """What fair draws typically produce: the median of the most extreme of many items."""
+
+    def test_typical_extreme_z_is_the_median_of_the_largest_absolute_z_score(self) -> None:
+        normal = statistics.NormalDist()
+        for count in (1, 12, 50, 1225):
+            level = typical_extreme_z(count)
+            # All `count` z-scores stay within +/-level exactly half of the time.
+            assert (2 * normal.cdf(level) - 1) ** count == pytest.approx(0.5)
+        assert typical_extreme_z(1) == pytest.approx(0.674, abs=0.001)
+        assert typical_extreme_z(12) == pytest.approx(1.91, abs=0.01)
+        assert typical_extreme_z(50) == pytest.approx(2.46, abs=0.01)
+        with pytest.raises(ValueError, match="count"):
+            typical_extreme_z(0)
+
+    @pytest.mark.parametrize(("kind", "pool", "absent", "expected"), MEDIAN_GAPS)
+    def test_typical_longest_gap_is_reached_half_of_the_time(
+        self, kind: BallKind, pool: int, absent: float, expected: int
+    ) -> None:
+        def reached(gap: int) -> float:
+            """Probability that at least one number of the pool is absent for `gap` draws."""
+            return 1 - (1 - absent**gap) ** pool
+
+        assert typical_longest_gap(kind) == expected
+        assert reached(expected) >= 0.5 > reached(expected + 1)
+
+    @pytest.mark.parametrize(
+        ("draws", "chance", "candidates"),
+        [(10, 0.5, 1), (10, 0.5, 1000), (1998, 10 / 1225, 1225), (1058, 1 / 66, 66), (3, 0.2, 5)],
+    )
+    def test_typical_top_count_is_reached_by_some_item_half_of_the_time(
+        self, draws: int, chance: float, candidates: int
+    ) -> None:
+        def reached(count: int) -> float:
+            """Probability that at least one of the items comes up `count` times or more."""
+
+            def log_probability(k: int) -> float:
+                """Logarithm of the binomial probability of exactly `k` occurrences."""
+                return (
+                    math.lgamma(draws + 1)
+                    - math.lgamma(k + 1)
+                    - math.lgamma(draws - k + 1)
+                    + k * math.log(chance)
+                    + (draws - k) * math.log(1 - chance)
+                )
+
+            one_item = sum(math.exp(log_probability(k)) for k in range(count, draws + 1))
+            return 1 - (1 - one_item) ** candidates
+
+        top = typical_top_count(draws, chance, candidates)
+        assert reached(top) >= 0.5 > reached(top + 1)
+
+    def test_typical_top_count_of_known_cases(self) -> None:
+        assert typical_top_count(10, 0.5, 1) == 5
+        assert typical_top_count(1998, 10 / 1225, 1225) == 31  # pairs over the real history
+        assert typical_top_count(0, 0.1, 50) == 0
+        assert typical_top_count(10, 0.0, 50) == 0
+
+    def test_rankings_carry_the_yardstick_of_their_own_draws(self) -> None:
+        report = analyze(SYNTHETIC)
+        assert isinstance(report.top_pairs, Ranking)
+        assert report.top_pairs.typical_top == typical_top_count(300, 10 / 1225, 1225)
+        assert report.top_triplets.typical_top == typical_top_count(300, 10 / 19600, 19600)
+        assert report.top_star_pairs.typical_top == typical_top_count(100, 1 / 66, 66)
+
+    def test_ranking_of_a_history_without_any_draw_with_todays_stars(self) -> None:
+        ranking = analyze(ERAS[:2]).top_star_pairs
+        assert ranking == Ranking(entries=[], more=0, expected=0.0, typical_top=0)

@@ -25,7 +25,6 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from itertools import combinations, pairwise
-from typing import TypeVar
 
 from euromillions.models import (
     MAIN_COUNT,
@@ -43,8 +42,6 @@ LOW_MAX = 25
 #: One draw as seen by one kind of ball: ``(date, balls drawn, pool size)``.
 _Row = tuple[dt.date, tuple[int, ...], int]
 
-_Combo = TypeVar("_Combo", bound=tuple[int, ...])
-
 
 def _require_positive(name: str, value: int) -> None:
     if value < 1:
@@ -60,11 +57,6 @@ def _tally(observations: Iterable[int], keys: range) -> dict[int, int]:
     """Count the observations per value, with every value of ``keys`` present, in order."""
     counts = Counter(observations)
     return {key: counts[key] for key in keys}
-
-
-def _most_common(counts: Counter[_Combo], top: int) -> list[tuple[_Combo, int]]:
-    """Return the ``top`` most frequent combinations; ties go to the lowest combination."""
-    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:top]
 
 
 # --- Single lines -------------------------------------------------------------------------------
@@ -278,9 +270,18 @@ def overdue_numbers(
 
 
 def pair_counts(draws: Iterable[Draw], kind: BallKind = "main") -> Counter[tuple[int, int]]:
-    """Count how often each pair ``(a, b)``, ``a < b``, of ``kind`` balls was drawn together."""
+    """Count how often each pair ``(a, b)``, ``a < b``, of ``kind`` balls was drawn together.
+
+    Only the draws held with today's pool are counted, so that every pair had the same
+    chance in each of them: older draws would favour the pairs of the stars that were
+    already in the smaller pools. For main numbers that is every draw.
+    """
+    pool = MAIN_MAX if kind == "main" else STAR_MAX
     return Counter(
-        pair for draw in recent(draws, None) for pair in combinations(_balls(draw, kind), 2)
+        pair
+        for draw in recent(draws, None)
+        if pool_size(kind, draw.date) == pool
+        for pair in combinations(_balls(draw, kind), 2)
     )
 
 
@@ -412,7 +413,82 @@ def low_count_distribution(draws: Iterable[Draw]) -> dict[int, int]:
     return _tally((low_count(draw.numbers) for draw in draws), range(MAIN_COUNT + 1))
 
 
+# --- What chance alone produces -----------------------------------------------------------------
+#
+# Rankings show extremes, and extremes look meaningful even when they are not. These
+# yardsticks say how far fair draws typically push the most extreme of many items: each is
+# the median of that extreme, i.e. the level it reaches half of the time.
+
+
+def typical_extreme_z(count: int) -> float:
+    """Return the largest absolute z-score typically found among ``count`` of them."""
+    _require_positive("count", count)
+    return statistics.NormalDist().inv_cdf((1 + 0.5 ** (1 / count)) / 2)
+
+
+def typical_longest_gap(kind: BallKind = "main") -> int:
+    """Return the longest current gap typically found among the ``kind`` pool, in draws.
+
+    Under the current rules a number is absent from a draw with probability
+    ``1 - picks / pool``, so each gap follows a geometric distribution.
+    """
+    pool = MAIN_MAX if kind == "main" else STAR_MAX
+    absent = 1 - picks_per_draw(kind) / pool
+    return math.floor(math.log(1 - 0.5 ** (1 / pool)) / math.log(absent))
+
+
+def typical_top_count(draws: int, chance: float, candidates: int) -> int:
+    """Return the count typically reached by the most frequent of ``candidates`` items.
+
+    Each item comes up in each of the ``draws`` with probability ``chance``. The result is
+    the highest count that at least one of them is more likely than not to reach, treating
+    the items as independent (a good approximation when ``chance`` is small).
+    """
+    if draws < 1 or not 0 < chance < 1:
+        return 0
+    needed = 1 - 0.5 ** (1 / candidates)  # tail probability one item needs for that
+    probability = (1 - chance) ** draws  # of exactly `count` occurrences, starting at 0
+    below = 0.0
+    for count in range(draws + 1):
+        if 1 - below < needed:
+            return count - 1
+        below += probability
+        probability *= (draws - count) / (count + 1) * chance / (1 - chance)
+    return draws
+
+
 # --- Full report --------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Ranking:
+    """The combinations most often drawn together, with what chance alone would give."""
+
+    #: ``(combination, occurrences)``, most frequent first; ties go to the lowest combination.
+    entries: list[tuple[tuple[int, ...], int]]
+    #: Further combinations that occurred as often as the last entry but did not fit.
+    more: int
+    #: Occurrences expected for any single combination if every counted draw were fair.
+    expected: float
+    #: Occurrences that the luckiest combination typically reaches in as many fair draws.
+    typical_top: int
+
+
+def _ranking(
+    counts: Counter[tuple[int, int]] | Counter[tuple[int, int, int]], top: int, kind: BallKind
+) -> Ranking:
+    """Rank the ``top`` most frequent combinations of ``kind`` balls counted in ``counts``."""
+    ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    entries: list[tuple[tuple[int, ...], int]] = list(ordered[:top])
+    more = sum(count == entries[-1][1] for _, count in ordered[top:]) if entries else 0
+
+    size = len(next(iter(counts), ()))
+    pool = MAIN_MAX if kind == "main" else STAR_MAX
+    possible = math.comb(pool, size)
+    per_draw = math.comb(picks_per_draw(kind), size)  # combinations held by each counted draw
+    draws = sum(counts.values()) // per_draw if counts else 0
+    chance = per_draw / possible
+    return Ranking(entries, more, draws * chance, typical_top_count(draws, chance, possible))
 
 
 @dataclass(frozen=True, slots=True)
@@ -436,10 +512,10 @@ class AnalysisReport:
     hot_stars: list[NumberStats]
     cold_stars: list[NumberStats]
     overdue_stars: list[NumberStats]
-    #: ``(combination, occurrences)``, most frequent first; ties go to the lowest combination.
-    top_pairs: list[tuple[tuple[int, int], int]]
-    top_triplets: list[tuple[tuple[int, int, int], int]]
-    top_star_pairs: list[tuple[tuple[int, int], int]]
+    top_pairs: Ranking
+    top_triplets: Ranking
+    #: Like :func:`pair_counts`, only covers the draws held with today's twelve stars.
+    top_star_pairs: Ranking
     consecutive: ConsecutiveStats
     sums: Distribution
     ranges: Distribution
@@ -471,9 +547,9 @@ def analyze(draws: Iterable[Draw], *, window: int = 50, top: int = 10) -> Analys
         hot_stars=hot_numbers(history, "star", window=window, top=top),
         cold_stars=cold_numbers(history, "star", window=window, top=top),
         overdue_stars=overdue_numbers(history, "star", top=top),
-        top_pairs=_most_common(pair_counts(history, "main"), top),
-        top_triplets=_most_common(triplet_counts(history), top),
-        top_star_pairs=_most_common(pair_counts(history, "star"), top),
+        top_pairs=_ranking(pair_counts(history, "main"), top, "main"),
+        top_triplets=_ranking(triplet_counts(history), top, "main"),
+        top_star_pairs=_ranking(pair_counts(history, "star"), top, "star"),
         consecutive=consecutive_stats(history),
         sums=sum_distribution(history),
         ranges=range_distribution(history),

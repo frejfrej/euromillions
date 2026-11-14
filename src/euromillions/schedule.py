@@ -5,8 +5,13 @@ from __future__ import annotations
 import datetime as dt
 from zoneinfo import ZoneInfo
 
-#: Draw days as ``date.weekday()`` values (Monday is 0): Tuesday and Friday.
-DRAW_WEEKDAYS = frozenset({1, 4})
+from euromillions.models import FIRST_DRAW_DATE
+
+#: Draws have been held every Friday since the first one, and also every Tuesday since
+#: this date.
+TUESDAY_DRAWS_SINCE = dt.date(2011, 5, 10)
+
+_TUESDAY, _FRIDAY = 1, 4  # as returned by date.weekday()
 
 #: Approximate time of the draw, in Paris local time.
 DRAW_TIME = dt.time(21, 5)
@@ -14,8 +19,11 @@ DRAW_TIMEZONE = ZoneInfo("Europe/Paris")
 
 
 def is_draw_day(day: dt.date) -> bool:
-    """Return whether a draw is scheduled on ``day``."""
-    return day.weekday() in DRAW_WEEKDAYS
+    """Return whether a draw is, or was, scheduled on ``day``."""
+    if day < FIRST_DRAW_DATE:
+        return False
+    weekday = day.weekday()
+    return weekday == _FRIDAY or (weekday == _TUESDAY and day >= TUESDAY_DRAWS_SINCE)
 
 
 def draw_datetime(day: dt.date) -> dt.datetime:

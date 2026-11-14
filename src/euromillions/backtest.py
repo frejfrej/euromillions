@@ -6,9 +6,9 @@ draws that came before it, and scored with the prizes actually paid that day.
 
 Every strategy rests on a hypothesis (hot numbers stay hot, overdue numbers
 are due, ...). If one of them had any predictive power, its lines would match
-more numbers on unseen draws than chance allows, which is exactly what the
-z-scores of a :class:`StrategyResult` measure. Money is a much noisier signal:
-half of the prize money sits in a jackpot that a backtest virtually never hits.
+more numbers on unseen draws than chance allows, which is what the z-scores of
+a :class:`StrategyResult` measure. Money is a much noisier signal: half of the
+prize money sits in top ranks that a backtest virtually never hits.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import datetime as dt
 import math
 import random
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from statistics import fmean
 
@@ -63,6 +63,11 @@ EXPECTED_MATCHES: dict[BallKind, float] = {
     "star": STAR_COUNT * STAR_COUNT / STAR_MAX,
 }
 
+#: The three top ranks are often won by nobody, and then have no published prize. Every
+#: other rank is won at each draw: these "common" ranks are all a backtest realistically hits.
+TOP_RANKS = 3
+COMMON_RANKS: tuple[int, ...] = tuple(sorted(PRIZE_RANKS.values()))[TOP_RANKS:]
+
 
 @dataclass(frozen=True, slots=True)
 class Win:
@@ -79,9 +84,11 @@ class StrategyResult:
 
     ``main_z`` and ``star_z`` compare the numbers and stars matched with what
     pure chance would give: they are z-scores under the exact distribution of a
-    fair draw, so values beyond about 2 in absolute value would be unusual.
-    ``estimated_wins`` counts wins of a rank nobody actually won that day, whose
-    amount is therefore an estimate (the average prize pool of that rank).
+    fair draw. Each one lies beyond 2 in absolute value about once in 22 by
+    chance alone, so several of them must be read together, not one by one.
+    ``estimated_wins`` counts the wins whose amount had to be estimated: a top
+    rank that nobody actually won that day (valued at the average pool of that
+    rank in earlier draws), or a rank whose number of winners is unknown.
     """
 
     strategy: str
@@ -104,7 +111,7 @@ class StrategyResult:
     @property
     def roi(self) -> float:
         """Net result as a fraction of the cost (-1.0 means everything was lost)."""
-        return self.net / self.cost if self.cost else 0.0
+        return self.net / self.cost
 
     @property
     def winning_lines(self) -> int:
@@ -131,6 +138,11 @@ class Backtest:
     ``test_draws`` counts the draws actually played. ``skipped_draws`` counts
     those of the evaluation period that could not be scored for lack of prize
     data; strategies still see them as history when suggesting later lines.
+
+    ``chance_winnings`` is what as many uniformly random lines are expected to
+    win on the same draws from the common ranks (4 to 13), and
+    ``chance_winnings_sd`` the standard deviation of that amount: the yardstick
+    for the winnings of every strategy, whose differences are otherwise noise.
     """
 
     train_draws: int
@@ -143,6 +155,8 @@ class Backtest:
     lines_per_draw: int
     line_price: float
     refresh: bool
+    chance_winnings: float
+    chance_winnings_sd: float
     results: list[StrategyResult]
 
 
@@ -187,8 +201,8 @@ def backtest(
         raise ValueError(f"lines must be at least 1, got {lines}")
     if window < 1:
         raise ValueError(f"window must be at least 1, got {window}")
-    if line_price < 0:
-        raise ValueError(f"line_price cannot be negative, got {line_price}")
+    if not (line_price > 0 and math.isfinite(line_price)):
+        raise ValueError(f"line_price must be a positive amount, got {line_price}")
 
     # The tiny offset keeps e.g. 0.58 * 100 (57.99999999999999 in floating point) at 58 draws.
     split = math.floor(len(history) * train_fraction + 1e-9)
@@ -199,24 +213,22 @@ def backtest(
         )
     if history[split].date < CURRENT_RULES_SINCE:
         older = sum(draw.date < CURRENT_RULES_SINCE for draw in history)
-        # Rounded up, so that the fraction suggested is always large enough.
-        minimum = math.ceil(round(older / len(history) * 1000, 6)) / 1000
+        if older == len(history):
+            raise ValueError(
+                f"no draw is under the current rules ({CURRENT_RULES_SINCE}): nothing to evaluate"
+            )
         raise ValueError(
             f"the evaluation would start on {history[split].date}, before the current rules "
-            f"({CURRENT_RULES_SINCE}); use a train fraction of at least {minimum:.3f}"
+            f"({CURRENT_RULES_SINCE}); use a train fraction of at least "
+            f"{_round_up(older / len(history))}"
         )
-    scored = [
-        index
-        for index in range(split, len(history))
-        if len(history[index].prizes) == len(PRIZE_RANKS)
-    ]
+    scored = [index for index in range(split, len(history)) if _is_scorable(history[index])]
     if not scored:
         raise ValueError(
             "none of the draws to evaluate has prize data; run `euromillions fetch --force` "
             "to download it"
         )
 
-    pools = _average_pools(history)
     results = [
         _play(
             name,
@@ -227,12 +239,14 @@ def backtest(
             window=window,
             refresh=refresh,
             line_price=line_price,
-            pools=pools,
             # One independent, reproducible stream per strategy, whichever others are evaluated.
             rng=random.Random(None if seed is None else f"{seed}:{name}"),
         )
         for name in strategies
     ]
+    chance_winnings, chance_winnings_sd = _chance_winnings(
+        [history[index] for index in scored], lines
+    )
     return Backtest(
         train_draws=split,
         train_start=history[0].date,
@@ -244,7 +258,31 @@ def backtest(
         lines_per_draw=lines,
         line_price=line_price,
         refresh=refresh,
+        chance_winnings=chance_winnings,
+        chance_winnings_sd=chance_winnings_sd,
         results=results,
+    )
+
+
+def _round_up(fraction: float) -> str:
+    """Format a fraction below 1 rounded up, with as few decimals (from three) as keep it so."""
+    for decimals in range(3, 10):
+        scale = 10**decimals
+        # Rounding first absorbs float noise such as 0.6 * 1000 == 600.0000000000001.
+        rounded = math.ceil(round(fraction * scale, 6)) / scale
+        if rounded < 1:
+            return f"{rounded:.{decimals}f}"
+    return repr(fraction)
+
+
+def _is_scorable(draw: Draw) -> bool:
+    """Tell whether ``draw`` carries the prizes needed to score any line played on it.
+
+    The common ranks are won at every draw: a missing amount there is a gap in the data,
+    not a rank that nobody won.
+    """
+    return len(draw.prizes) == len(PRIZE_RANKS) and all(
+        tier.prize for tier in draw.prizes[TOP_RANKS:]
     )
 
 
@@ -258,7 +296,6 @@ def _play(
     window: int,
     refresh: bool,
     line_price: float,
-    pools: Mapping[int, float],
     rng: random.Random,
 ) -> StrategyResult:
     """Play one strategy on the draws at the ``scored`` indexes of ``history``.
@@ -290,7 +327,7 @@ def _play(
             variance[kind] += _chance_variance(played, kind)
 
         for rank, count in Counter(rank for rank in ranks if rank is not None).items():
-            amount, estimated = _prize(draw, rank, count, pools)
+            amount, estimated = _prize(history, index, rank, count)
             wins_by_rank[rank] += count
             winnings += amount * count
             estimated_wins += count if estimated else 0
@@ -354,29 +391,52 @@ def _chance_variance(played: Sequence[Suggestion], kind: BallKind) -> float:
     return p * (1 - p) * (squares - (total * total - squares) / (pool - 1))
 
 
-def _average_pools(history: Iterable[Draw]) -> dict[int, float]:
-    """Return the average prize pool of each rank over the draws where it was won."""
-    pools: dict[int, list[float]] = {}
-    for draw in history:
-        if draw.date < CURRENT_RULES_SINCE or len(draw.prizes) != len(PRIZE_RANKS):
-            continue
-        for rank, tier in enumerate(draw.prizes, start=1):
-            if tier.winners and tier.prize:
-                pools.setdefault(rank, []).append(tier.winners * tier.prize)
-    return {rank: fmean(amounts) for rank, amounts in pools.items()}
+def _chance_winnings(draws: Iterable[Draw], lines: int) -> tuple[float, float]:
+    """Return the mean and standard deviation of what random lines win from the common ranks.
+
+    ``lines`` independent, uniformly random lines are played on each of the ``draws``.
+    The top ranks are left out: they would dominate both figures while almost never
+    showing up in an actual backtest.
+    """
+    mean = variance = 0.0
+    for draw in draws:
+        first_moment = second_moment = 0.0
+        for rank in COMMON_RANKS:
+            amount = _shared(draw, rank, 1)
+            first_moment += RANK_PROBABILITIES[rank] * amount
+            second_moment += RANK_PROBABILITIES[rank] * amount * amount
+        mean += lines * first_moment
+        variance += lines * (second_moment - first_moment * first_moment)
+    return mean, math.sqrt(variance)
 
 
-def _prize(draw: Draw, rank: int, sharing: int, pools: Mapping[int, float]) -> tuple[float, bool]:
-    """Return what each of ``sharing`` extra winning lines would have received.
+def _shared(draw: Draw, rank: int, sharing: int) -> float:
+    """Return what each of ``sharing`` extra winners of a rank that was won would have received.
 
-    Prizes are pari-mutuel: the lines played here would have shared the pool of
-    their rank with the real winners. When nobody won that rank, the pool is
-    not published and the average pool of the rank stands in for it; the second
-    value tells whether the amount is such an estimate.
+    Prizes are pari-mutuel: the pool of a rank is split between its winners, so the lines
+    played here would have shared it with the real ones. Without the number of real
+    winners (missing from the source for a few draws), the published prize is kept as is.
     """
     tier = draw.prizes[rank - 1]
-    if not tier.prize:
-        return pools.get(rank, 0.0) / sharing, True
-    if not tier.winners:  # The number of winners is missing from the source for a few draws.
-        return tier.prize, False
-    return tier.prize * tier.winners / (tier.winners + sharing), False
+    return tier.prize * tier.winners / (tier.winners + sharing) if tier.winners else tier.prize
+
+
+def _prize(history: Sequence[Draw], index: int, rank: int, sharing: int) -> tuple[float, bool]:
+    """Return what each of the ``sharing`` lines winning ``rank`` on ``history[index]`` gets.
+
+    The second value tells whether the amount is an estimate: the number of real winners
+    is unknown or, for a top rank that nobody won that day, the pool is. An unknown pool is
+    replaced by the average pool of the rank over the earlier draws in which it was won
+    (never later ones, which were still in the future).
+    """
+    draw = history[index]
+    tier = draw.prizes[rank - 1]
+    if tier.prize:
+        return _shared(draw, rank, sharing), not tier.winners
+    pools = [
+        earlier.prizes[rank - 1].winners * earlier.prizes[rank - 1].prize
+        for earlier in history[:index]
+        if earlier.date >= CURRENT_RULES_SINCE and len(earlier.prizes) == len(PRIZE_RANKS)
+    ]
+    won = [pool for pool in pools if pool]
+    return (fmean(won) / sharing if won else 0.0), True

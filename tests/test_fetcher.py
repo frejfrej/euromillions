@@ -13,7 +13,8 @@ import json
 import logging
 import os
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,7 @@ from euromillions.fetcher import (
     HISTORY_PAGE_URL,
     KNOWN_ARCHIVE_URLS,
     CacheError,
+    CorruptCacheError,
     FetchError,
     UpdateResult,
     discover_archive_urls,
@@ -37,16 +39,28 @@ from euromillions.fetcher import (
     save_draws,
     update_cache,
 )
-from euromillions.models import Draw, PrizeTier
+from euromillions.models import FIRST_DRAW_DATE, Draw, PrizeTier
 from euromillions.schedule import DRAW_TIMEZONE
 
-from .conftest import TYPICAL_PRIZES
+from .conftest import TYPICAL_PRIZES, random_history
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
-#: What a fake website answers: the body of a 200 response, an HTTP error status, or an
-#: exception to raise.
-Outcome = bytes | int | Exception
+
+@dataclass(frozen=True)
+class Redirect:
+    """An HTTP redirection to ``location``."""
+
+    status: int
+    location: str
+
+
+#: What a fake website answers: the body of a 200 response, an HTTP error status, a
+#: redirection, or an exception to raise.
+Outcome = bytes | int | Redirect | Exception
+
+#: The tolerance of the real completeness check, before any test relaxes it.
+REAL_MAX_GAP = fetcher._MAX_GAP
 
 
 def read_fixture(name: str) -> bytes:
@@ -59,6 +73,10 @@ def tiers(*pairs: tuple[int, float]) -> tuple[PrizeTier, ...]:
 
 def paris(year: int, month: int, day: int, hour: int = 12, minute: int = 0) -> dt.datetime:
     return dt.datetime(year, month, day, hour, minute, tzinfo=DRAW_TIMEZONE)
+
+
+#: When most tests take place: the day after the newest draw of the fixtures.
+NOW = paris(2026, 11, 14)
 
 
 #: The rows of each fixture, in file order, as (date, main numbers, Lucky Stars, jackpot tier).
@@ -143,11 +161,13 @@ EXPECTED_PRIZES: dict[tuple[str, dt.date], tuple[PrizeTier, ...]] = {
 HEADER = "date_de_tirage;boule_1;boule_2;boule_3;boule_4;boule_5;etoile_1;etoile_2"
 ROW = "13/11/2026;41;32;45;27;16;12;2"
 NEWEST = Draw(dt.date(2026, 11, 13), (16, 27, 32, 41, 45), (2, 12))
-#: The same with two prize ranks, under their names before September 2016.
-PRIZE_HEADER = (
-    HEADER + ";nombre_de_gagnant_au_rang1_en_europe;rapport_du_rang1"
-    ";nombre_de_gagnant_au_rang2_en_europe;rapport_du_rang2"
+#: The same with the thirteen prize ranks, under their names before September 2016.
+PRIZE_HEADER = HEADER + "".join(
+    f";nombre_de_gagnant_au_rang{rank}_en_europe;rapport_du_rang{rank}" for rank in range(1, 14)
 )
+#: The cells of ranks 3 to 13 in the rows of such a file: the tests only vary the first two.
+LOWER_RANKS = "".join(f";{1000 * rank};{20 - rank},5" for rank in range(3, 14))
+LOWER_TIERS = tuple(PrizeTier(1000 * rank, 20.5 - rank) for rank in range(3, 14))
 
 
 def csv_file(*lines: str) -> bytes:
@@ -162,12 +182,43 @@ def zip_of(files: Mapping[str, bytes]) -> bytes:
     return buffer.getvalue()
 
 
+def csv_of(draws: Iterable[Draw]) -> bytes:
+    """Write draws the way FDJ does, without their prizes."""
+    return csv_file(
+        HEADER,
+        *(f"{d.date:%d/%m/%Y};" + ";".join(map(str, (*d.numbers, *d.stars))) for d in draws),
+    )
+
+
 @pytest.fixture(scope="module")
 def fdj_draws() -> list[Draw]:
     """Every draw of the fixtures, oldest first (the parser itself is checked separately)."""
     draws = merge_draws(*(parse_csv(read_fixture(name)) for name in EXPECTED))
     assert [draw.date for draw in draws] == ALL_DATES
     return draws
+
+
+@pytest.fixture(scope="module")
+def full_history() -> list[Draw]:
+    """A draw on every draw day from the first to 2026-11-13: 1998 of them, as in reality."""
+    draws = random_history(1998, start=FIRST_DRAW_DATE)
+    assert draws[-1].date == NEWEST.date
+    return draws
+
+
+@pytest.fixture(autouse=True)
+def excerpts_pass_for_a_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let the 21 draws of the fixtures pass for a complete history.
+
+    A real history has no hole longer than two weeks. The tests of that rule ask for the
+    ``strict`` fixture, which puts the real tolerance back.
+    """
+    monkeypatch.setattr(fetcher, "_MAX_GAP", dt.timedelta(days=10_000))
+
+
+@pytest.fixture
+def strict(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(fetcher, "_MAX_GAP", REAL_MAX_GAP)
 
 
 # --- Fake website ---------------------------------------------------------------------
@@ -203,8 +254,12 @@ class FakeTransport(BaseAdapter):
         response = requests.Response()
         response.request = request
         response.url = request.url
-        response.status_code = outcome if isinstance(outcome, int) else 200
-        response.raw = io.BytesIO(b"" if isinstance(outcome, int) else outcome)
+        if isinstance(outcome, Redirect):
+            response.status_code = outcome.status
+            response.headers["Location"] = outcome.location
+        else:
+            response.status_code = outcome if isinstance(outcome, int) else 200
+        response.raw = io.BytesIO(outcome if isinstance(outcome, bytes) else b"")
         return response
 
     def close(self) -> None:
@@ -234,6 +289,20 @@ def website() -> dict[str, Outcome]:
     routes: dict[str, Outcome] = {HISTORY_PAGE_URL: read_fixture("history_page.html")}
     for url, name in ARCHIVE_FILES.items():
         routes[url] = zip_of({name: read_fixture(name)})
+    return routes
+
+
+def site_serving(*files: Iterable[Draw]) -> dict[str, Outcome]:
+    """A website whose page is down and whose known archives hold the given files of draws.
+
+    There are at most six files; the remaining archives repeat the first draw of all.
+    """
+    contents = [csv_of(draws) for draws in files]
+    filler = csv_file(*contents[0].decode().splitlines()[:2])
+    routes: dict[str, Outcome] = {HISTORY_PAGE_URL: 503}
+    for index, url in enumerate(KNOWN_ARCHIVE_URLS):
+        content = contents[index] if index < len(contents) else filler
+        routes[url] = zip_of({"draws.csv": content})
     return routes
 
 
@@ -297,15 +366,24 @@ def test_parse_csv_keeps_one_row_per_line_whatever_the_quotes() -> None:
 
 
 def test_parse_csv_reads_the_ranks_in_order_and_decimal_commas() -> None:
-    draws = parse_csv(csv_file(PRIZE_HEADER, ROW + ";1;17000000,5;3;250000"))
-    assert draws == [
-        Draw(NEWEST.date, NEWEST.numbers, NEWEST.stars, tiers((1, 17000000.5), (3, 250000)))
-    ]
+    draws = parse_csv(csv_file(PRIZE_HEADER, ROW + ";1;17000000,5;3;250000" + LOWER_RANKS))
+    top_tiers = tiers((1, 17000000.5), (3, 250000))
+    assert draws == [Draw(NEWEST.date, NEWEST.numbers, NEWEST.stars, top_tiers + LOWER_TIERS)]
+    assert len(draws[0].prizes) == 13
 
 
-@pytest.mark.parametrize("cells", ["1;17000000,5;3;", "1;17000000,5;;250000", ";;;", "1"])
+@pytest.mark.parametrize(
+    "cells",
+    [
+        "1;17000000,5;3;" + LOWER_RANKS,
+        "1;17000000,5;;250000" + LOWER_RANKS,
+        ";;;" + LOWER_RANKS,
+        "1;17000000,5;3;250000" + LOWER_RANKS.rpartition(";")[0] + ";",  # the very last cell
+        "1;17000000,5;3;250000",  # a row that stops short of its last prize cells
+        "1",
+    ],
+)
 def test_parse_csv_drops_the_prizes_of_a_row_with_a_blank_prize_cell(cells: str) -> None:
-    # The last case is a row that stops short of its prize cells.
     assert parse_csv(csv_file(PRIZE_HEADER, f"{ROW};{cells}")) == [NEWEST]
 
 
@@ -333,28 +411,68 @@ def test_a_blank_prize_cell_only_affects_its_own_row() -> None:
     ],
 )
 def test_parse_csv_rejects_a_malformed_prize_cell(cells: str) -> None:
+    good = ROW + ";1;17000000,5;3;250000" + LOWER_RANKS
     with pytest.raises(FetchError, match=r"line 3: invalid (number|amount)"):
-        parse_csv(csv_file(PRIZE_HEADER, ROW + ";1;17000000,5;3;250000", f"{ROW};{cells}"))
+        parse_csv(csv_file(PRIZE_HEADER, good, f"{ROW};{cells}{LOWER_RANKS}"))
+
+
+def test_parse_csv_rejects_absurd_figures() -> None:
+    # Far beyond any count of winners or amount, and beyond what a float can hold.
+    for cells in ("9" * 400 + ";17000000,5;3;250000", "1;" + "9" * 400 + ";3;250000"):
+        with pytest.raises(FetchError, match="line 2: "):
+            parse_csv(csv_file(PRIZE_HEADER, f"{ROW};{cells}{LOWER_RANKS}"))
 
 
 def test_parse_csv_takes_only_the_european_euromillions_ranks() -> None:
-    # None of these look-alikes is a prize rank of the main game.
+    # The look-alikes of the real files, placed before the columns of the ranks themselves.
     header = (
-        HEADER + ";nombre_de_gagnant_au_rang1_en_france;nombre_de_gagnant_au_rang10_en_europe"
-        ";rapport_du_rang10;nombre_de_gagnant_au_rang1_Etoile+;rapport_du_rang1_Etoile+"
-        ";nombre_de_gagnant_au_rang1_Euro_Millions_en_france"
+        HEADER + ";nombre_de_gagnant_au_rang1_en_france;nombre_de_gagnant_au_rang1_Etoile+"
+        ";rapport_du_rang1_Etoile+;nombre_de_gagnant_au_rang1_Euro_Millions_en_france"
+        + PRIZE_HEADER.removeprefix(HEADER)
     )
-    assert parse_csv(csv_file(header, ROW + ";7;8;9,5;3;4,5;6")) == [NEWEST]
+    (draw,) = parse_csv(csv_file(header, ROW + ";7;8;9,5;6;1;17000000,5;3;250000" + LOWER_RANKS))
+    assert draw.prizes == tiers((1, 17000000.5), (3, 250000)) + LOWER_TIERS
 
 
-def test_parse_csv_stops_at_the_first_rank_lacking_a_column() -> None:
-    header = (
-        HEADER + ";nombre_de_gagnant_au_rang1_Euro_Millions_en_europe"
-        ";rapport_du_rang1_Euro_Millions;nombre_de_gagnant_au_rang2_Euro_Millions_en_europe"
-        ";nombre_de_gagnant_au_rang3_Euro_Millions_en_europe;rapport_du_rang3_Euro_Millions"
-    )
-    (draw,) = parse_csv(csv_file(header, ROW + ";2;8500000;4;5;6,5"))
-    assert draw.prizes == tiers((2, 8500000))
+@pytest.mark.parametrize(
+    ("header", "ranks"),
+    [
+        # Renamed columns: none of the ranks is recognised any more.
+        (PRIZE_HEADER.replace("_en_europe", "_in_europe"), 0),
+        (HEADER + ";nombre_de_gagnant_au_rang1_Etoile+;rapport_du_rang1_Etoile+", 0),
+        # Rank 2 lacks its prize column: the ranks would stop there.
+        (PRIZE_HEADER.replace(";rapport_du_rang2", ";rapport_rang2"), 1),
+        # Fewer ranks than the game ever had, then more.
+        (PRIZE_HEADER.rpartition(";nombre_de_gagnant_au_rang12")[0], 11),
+        (PRIZE_HEADER + ";nombre_de_gagnant_au_rang14_en_europe;rapport_du_rang14", 14),
+    ],
+)
+def test_parse_csv_rejects_prize_columns_it_does_not_fully_understand(
+    header: str, ranks: int
+) -> None:
+    # Reading them as "no prizes" would silently drop what the file says.
+    message = rf"line 1: unexpected prize columns \({ranks} complete ranks found\)"
+    with pytest.raises(FetchError, match=message):
+        parse_csv(csv_file(header, ROW))
+
+
+def test_parse_csv_accepts_the_twelve_ranks_of_the_first_years() -> None:
+    header = PRIZE_HEADER.rpartition(";nombre_de_gagnant_au_rang13")[0]
+    row = "06/05/2011;11;16;20;22;28;4;9;1;17000000,5;3;250000" + LOWER_RANKS
+    (draw,) = parse_csv(csv_file(header, row))
+    assert draw.prizes == tiers((1, 17000000.5), (3, 250000)) + LOWER_TIERS[:10]
+
+
+@pytest.mark.parametrize("column", ["date_de_tirage", "boule_1", "etoile_2", "rapport_du_rang7"])
+def test_parse_csv_rejects_a_column_given_twice(column: str) -> None:
+    # Which of the two would be the right one?
+    with pytest.raises(FetchError, match=rf"line 1: column\(s\) {column} appear more than once"):
+        parse_csv(csv_file(f"{PRIZE_HEADER};{column}", ROW))
+
+
+def test_parse_csv_ignores_repeated_columns_it_does_not_read() -> None:
+    # The real files end with several unnamed columns.
+    assert parse_csv(csv_file(HEADER + ";code;code;;", ROW + ";A;B;;")) == [NEWEST]
 
 
 @pytest.mark.parametrize(
@@ -395,6 +513,12 @@ def test_parse_csv_rejects_a_file_that_is_empty_or_not_text(content: bytes) -> N
         parse_csv(content)
 
 
+def test_parse_csv_rejects_a_file_without_any_draw() -> None:
+    # An archive cut down to its header would otherwise leave a hole in the history.
+    with pytest.raises(FetchError, match="the file has no draw"):
+        parse_csv(csv_file(HEADER))
+
+
 # --- parse_archive --------------------------------------------------------------------
 
 
@@ -405,8 +529,25 @@ def test_parse_archive_reads_the_csv_file_of_an_archive() -> None:
 
 def test_parse_archive_reads_every_csv_file_and_nothing_else() -> None:
     first, second = read_fixture("euromillions_3.csv"), read_fixture("euromillions_4.csv")
-    archive = zip_of({"LISEZMOI.txt": b"hello", "a/one.csv": first, "TWO.CSV": second})
+    archive = zip_of(
+        {
+            "LISEZMOI.txt": b"hello",
+            "a/one.csv": first,
+            "TWO.CSV": second,
+            # What macOS and others add next to the real files.
+            "__MACOSX/a/._one.csv": b"\x00\x05\x16\x07",
+            ".hidden.csv": b"junk",
+            "a/.cache/three.csv": b"junk",
+        }
+    )
     assert parse_archive(archive) == parse_csv(first) + parse_csv(second)
+
+
+def test_parse_archive_refuses_too_many_csv_files() -> None:
+    content = read_fixture("euromillions_3.csv")
+    assert len(parse_archive(zip_of({f"{n}.csv": content for n in range(4)}))) == 12
+    with pytest.raises(FetchError, match="more than 4 CSV files"):
+        parse_archive(zip_of({f"{n}.csv": content for n in range(5)}))
 
 
 def damaged_archive(damage: str) -> bytes:
@@ -456,14 +597,22 @@ def test_parse_archive_caps_the_decompressed_size(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(fetcher, "_MAX_CSV_BYTES", len(content))
     assert len(parse_archive(archive)) == 4
     monkeypatch.setattr(fetcher, "_MAX_CSV_BYTES", len(content) - 1)
-    with pytest.raises(FetchError, match=r"euromillions\.csv: larger than \d+ bytes"):
+    with pytest.raises(FetchError, match=r"'euromillions\.csv': larger than \d+ bytes"):
         parse_archive(archive)
 
 
 def test_parse_archive_names_the_file_and_line_of_an_invalid_row() -> None:
     content = read_fixture("euromillions_3.csv").replace(b"23/09/16", b"23-09-16")
-    with pytest.raises(FetchError, match=r"^euromillions_3\.csv: line 2: invalid draw date"):
+    with pytest.raises(FetchError, match=r"^'euromillions_3\.csv': line 2: invalid draw date"):
         parse_archive(zip_of({"euromillions_3.csv": content}))
+
+
+def test_parse_archive_quotes_the_name_of_the_file_in_its_messages() -> None:
+    # The name comes from the archive: it must not reach a terminal as it is.
+    with pytest.raises(FetchError) as error:
+        parse_archive(zip_of({"\x1b]0;owned\x07.csv": b"not a csv"}))
+    assert "\x1b" not in str(error.value)
+    assert "\\x1b]0;owned\\x07.csv" in str(error.value)
 
 
 # --- discover_archive_urls ------------------------------------------------------------
@@ -507,11 +656,44 @@ def test_discover_archive_urls_reports_an_unavailable_page(outcome: Outcome) -> 
         discover_archive_urls(session)
 
 
+def test_discover_archive_urls_refuses_a_page_with_too_many_archives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, _ = fake_session(website())
+    monkeypatch.setattr(fetcher, "_MAX_ARCHIVES", 6)
+    assert len(discover_archive_urls(session)) == 6
+    monkeypatch.setattr(fetcher, "_MAX_ARCHIVES", 5)
+    with pytest.raises(FetchError, match="lists 6 archives"):
+        discover_archive_urls(session)
+
+
 def test_oversized_responses_are_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(fetcher, "_MAX_DOWNLOAD_BYTES", 1000)
     session, _ = fake_session(website())
     with pytest.raises(FetchError, match="response larger than 1000 bytes"):
         discover_archive_urls(session)
+
+
+def test_endless_responses_are_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Whatever the time each wait for data takes, the whole response has a time limit.
+    monkeypatch.setattr(fetcher, "_MAX_DOWNLOAD_SECONDS", -1.0)
+    session, _ = fake_session(website())
+    with pytest.raises(FetchError, match="no complete response within the time allowed"):
+        discover_archive_urls(session)
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_redirects_are_refused_not_followed(status: int) -> None:
+    elsewhere = "http://mirror.example.net/euromillions.zip"
+    session, transport = fake_session(
+        {
+            HISTORY_PAGE_URL: Redirect(status, elsewhere),
+            elsewhere: read_fixture("history_page.html"),
+        }
+    )
+    with pytest.raises(FetchError, match=f"unexpected redirect \\(HTTP {status}\\)"):
+        discover_archive_urls(session)
+    assert transport.urls == [HISTORY_PAGE_URL]
 
 
 # --- fetch_draws ----------------------------------------------------------------------
@@ -526,15 +708,24 @@ def test_fetch_draws_downloads_every_archive_listed_on_the_history_page(
     assert transport.timeouts == [7] * 7
 
 
-def test_fetch_draws_prefers_the_archives_of_the_page_to_the_known_ones() -> None:
-    new_url = KNOWN_ARCHIVE_URLS[-1].replace("afe6", "aff6")
-    page = f'<a title="Historique EuroMillions - My Million" href="{new_url}">zip</a>'
-    content = read_fixture("euromillions_202002.csv")
-    session, transport = fake_session(
-        {HISTORY_PAGE_URL: page.encode(), new_url: zip_of({"new.csv": content})}
+def test_fetch_draws_prefers_the_archives_of_the_page_to_the_known_ones(
+    fdj_draws: list[Draw],
+) -> None:
+    # FDJ reshuffles its files into two archives that the known list does not have.
+    new_urls = [KNOWN_ARCHIVE_URLS[-1].replace("afe6", suffix) for suffix in ("aff6", "aff7")]
+    page = "".join(
+        f'<a title="Historique EuroMillions - My Million" href="{url}">zip</a>' for url in new_urls
     )
-    assert fetch_draws(session) == sorted(parse_csv(content), key=lambda draw: draw.date)
-    assert transport.urls == [HISTORY_PAGE_URL, new_url]
+    names = list(EXPECTED)
+    session, transport = fake_session(
+        {
+            HISTORY_PAGE_URL: page.encode(),
+            new_urls[0]: zip_of({name: read_fixture(name) for name in names[:3]}),
+            new_urls[1]: zip_of({name: read_fixture(name) for name in names[3:]}),
+        }
+    )
+    assert fetch_draws(session) == fdj_draws
+    assert transport.urls == [HISTORY_PAGE_URL, *new_urls]
 
 
 @pytest.mark.parametrize(
@@ -586,6 +777,102 @@ def test_fetch_draws_rejects_archives_without_any_draw() -> None:
     session, _ = fake_session(routes)
     with pytest.raises(FetchError, match="no draw"):
         fetch_draws(session)
+
+
+def test_fetch_draws_keeps_the_prizes_when_a_draw_is_listed_twice(fdj_draws: list[Draw]) -> None:
+    # The newest draw is also in another archive, without its prizes, before and after.
+    routes = website()
+    for url in (KNOWN_ARCHIVE_URLS[0], KNOWN_ARCHIVE_URLS[-1]):
+        name = ARCHIVE_FILES[url]
+        routes[url] = zip_of({"extra.csv": csv_file(HEADER, ROW), name: read_fixture(name)})
+    session, _ = fake_session(routes)
+    assert fetch_draws(session) == fdj_draws
+    assert fetch_draws(session)[-1].prizes == TYPICAL_PRIZES
+
+
+def test_fetch_draws_rejects_two_different_draws_on_the_same_date() -> None:
+    routes = website()
+    other = csv_file(HEADER, ROW.replace(";41;", ";40;"))
+    routes[KNOWN_ARCHIVE_URLS[0]] = zip_of(
+        {"euromillions.csv": read_fixture("euromillions.csv"), "other.csv": other}
+    )
+    session, _ = fake_session(routes)
+    with pytest.raises(FetchError, match="two different draws are dated 2026-11-13"):
+        fetch_draws(session)
+
+
+def test_fetch_draws_accepts_a_complete_history(full_history: list[Draw], strict: None) -> None:
+    files = (full_history[:700], full_history[700:1400], full_history[1400:])
+    session, _ = fake_session(site_serving(*files))
+    assert fetch_draws(session, now=NOW) == full_history
+
+
+def test_fetch_draws_tolerates_a_draw_that_was_cancelled_or_is_late(
+    full_history: list[Draw], strict: None
+) -> None:
+    # One weekly draw of 2006 and two of 2012 are missing, and so is the latest one.
+    history = [*full_history[:100], *full_history[101:500], *full_history[502:-1]]
+    session, _ = fake_session(site_serving(history))
+    assert fetch_draws(session, now=NOW) == history
+
+
+def test_fetch_draws_rejects_a_history_that_does_not_start_at_the_first_draw(
+    full_history: list[Draw], strict: None
+) -> None:
+    session, _ = fake_session(site_serving(full_history[1:]))
+    with pytest.raises(FetchError, match="starts on 2004-02-20 instead of 2004-02-13"):
+        fetch_draws(session, now=NOW)
+
+
+def test_fetch_draws_rejects_a_history_with_a_hole(full_history: list[Draw], strict: None) -> None:
+    # An archive is missing from the page, or reduced to a few rows.
+    before, after = full_history[:800], full_history[805:]
+    session, _ = fake_session(site_serving(before, after))
+    message = f"no draw between {before[-1].date} and {after[0].date}"
+    with pytest.raises(FetchError, match=message):
+        fetch_draws(session, now=NOW)
+
+
+def test_fetch_draws_rejects_a_history_that_stops_short(
+    full_history: list[Draw], strict: None
+) -> None:
+    session, _ = fake_session(site_serving(full_history[:-6]))
+    with pytest.raises(FetchError, match="ends on 2026-10-23: its latest draws are missing"):
+        fetch_draws(session, now=NOW)
+
+
+def test_fetch_draws_rejects_a_draw_dated_off_schedule(full_history: list[Draw]) -> None:
+    thursday = Draw(dt.date(2026, 11, 12), (1, 2, 3, 4, 5), (1, 2))
+    session, _ = fake_session(site_serving([*full_history, thursday]))
+    with pytest.raises(FetchError, match=r"2026-11-12 \(Thursday\) is not a draw day"):
+        fetch_draws(session, now=NOW)
+    # Tuesdays only became draw days in May 2011.
+    tuesday = Draw(dt.date(2005, 3, 1), (1, 2, 3, 4, 5), (1, 2))
+    session, _ = fake_session(site_serving([*full_history, tuesday]))
+    with pytest.raises(FetchError, match=r"2005-03-01 \(Tuesday\) is not a draw day"):
+        fetch_draws(session, now=NOW)
+
+
+def test_fetch_draws_rejects_a_draw_dated_in_the_future(full_history: list[Draw]) -> None:
+    session, _ = fake_session(site_serving(full_history))
+    # On Friday the 13th before the draw, the latest draw is that of Tuesday the 10th.
+    with pytest.raises(FetchError, match="2026-11-13 is in the future"):
+        fetch_draws(session, now=paris(2026, 11, 13, 21, 4))
+    assert fetch_draws(session, now=paris(2026, 11, 13, 21, 5)) == full_history
+
+
+def test_fetch_draws_sends_no_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # requests would otherwise send the login found in ~/.netrc to any host.
+    netrc = tmp_path / "netrc"
+    netrc.write_text("default login alice password s3cret\n")
+    monkeypatch.setenv("NETRC", str(netrc))
+    transport = FakeTransport(website())
+    monkeypatch.setattr(
+        HTTPAdapter, "send", lambda adapter, request, **kwargs: transport.send(request, **kwargs)
+    )
+    fetch_draws()
+    assert len(transport.requests) == 7
+    assert not any("Authorization" in request.headers for request in transport.requests)
 
 
 def test_fetch_draws_uses_a_generic_session_of_its_own(
@@ -697,19 +984,27 @@ def test_load_draws_sorts_the_draws(tmp_path: Path) -> None:
         b' "stars": [2, 12]}]}',
         b'{"version": 1, "draws": [{"date": "2026-11-13", "numbers": [16, 27, 32, 41, 45],'
         b' "stars": [2, 12], "prizes": [[1, -5.0]]}]}',
+        # Figures and nesting that no real cache has.
+        b'{"version": 1, "draws": [{"date": "2026-11-13", "numbers": [16, 27, 32, 41, 45],'
+        b' "stars": [2, 12], "prizes": [[1' + b"0" * 400 + b", 5.0]]}]}",
+        b'{"version": 1, "draws": [{"date": "2026-11-13", "numbers": [16, 27, 32, 41, 45],'
+        b' "stars": [2, 12], "prizes": [[1, 1e999]]}]}',
+        b"[" * 200_000,
     ],
 )
 def test_load_draws_rejects_a_corrupt_cache(content: bytes, tmp_path: Path) -> None:
     path = tmp_path / "draws.json"
     path.write_bytes(content)
-    with pytest.raises(CacheError) as error:
+    with pytest.raises(CorruptCacheError) as error:
         load_draws(path)
     assert str(path) in str(error.value)
 
 
 def test_load_draws_rejects_an_unreadable_cache(tmp_path: Path) -> None:
-    with pytest.raises(CacheError, match="cannot read"):
+    with pytest.raises(CacheError, match="cannot read") as error:
         load_draws(tmp_path)  # a directory
+    # Nothing says the content is wrong: deleting the "file" would not be the way out.
+    assert not isinstance(error.value, CorruptCacheError)
 
 
 def test_save_draws_replaces_the_cache_only_once_fully_written(
@@ -726,7 +1021,7 @@ def test_save_draws_replaces_the_cache_only_once_fully_written(
 
     with monkeypatch.context() as patch:
         patch.setattr(os, "replace", fail)
-        with pytest.raises(OSError, match="disk full"):
+        with pytest.raises(CacheError, match=r"cannot write the draw cache .*disk full"):
             save_draws(fdj_draws, path)
     assert path.read_bytes() == before
     assert [entry.name for entry in tmp_path.iterdir()] == ["draws.json"]  # no temporary file
@@ -734,6 +1029,38 @@ def test_save_draws_replaces_the_cache_only_once_fully_written(
     save_draws(fdj_draws, path)
     assert load_draws(path) == fdj_draws
     assert [entry.name for entry in tmp_path.iterdir()] == ["draws.json"]
+
+
+def test_save_draws_reports_a_cache_that_cannot_be_written(tmp_path: Path) -> None:
+    (tmp_path / "data").write_text("a file where the directory should be")
+    with pytest.raises(CacheError, match="cannot write the draw cache") as error:
+        save_draws([NEWEST], tmp_path / "data" / "draws.json")
+    assert not isinstance(error.value, CorruptCacheError)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permissions")
+def test_save_draws_creates_the_cache_like_any_other_file(tmp_path: Path) -> None:
+    umask = os.umask(0)
+    os.umask(umask)
+    path = tmp_path / "draws.json"
+    save_draws([NEWEST], path)
+    assert path.stat().st_mode & 0o777 == 0o666 & ~umask  # not private to the user
+    # Permissions chosen by the user survive the next update.
+    path.chmod(0o640)
+    save_draws([NEWEST], path)
+    assert path.stat().st_mode & 0o777 == 0o640
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symbolic links need privileges on Windows")
+def test_save_draws_writes_through_a_symbolic_link(tmp_path: Path) -> None:
+    target = tmp_path / "elsewhere" / "draws.json"
+    target.parent.mkdir()
+    target.write_text("old")
+    link = tmp_path / "draws.json"
+    link.symlink_to(target)
+    save_draws([NEWEST], link)
+    assert link.is_symlink()
+    assert load_draws(target) == load_draws(link) == [NEWEST]
 
 
 # --- update_cache ---------------------------------------------------------------------
@@ -753,15 +1080,15 @@ def test_update_cache_makes_no_request_when_the_cache_is_fresh(
     path = tmp_path / "draws.json"
     save_draws(fdj_draws, path)
     session, transport = fake_session(website())
-    assert update_cache(path, session=session, now=now) == UpdateResult(fdj_draws, 0, False)
+    assert update_cache(path, session=session, now=now) == UpdateResult(fdj_draws, 0, 0, False)
     assert transport.requests == []
 
 
 def test_update_cache_fills_an_empty_cache(fdj_draws: list[Draw], tmp_path: Path) -> None:
     path = tmp_path / "data" / "draws.json"
     session, transport = fake_session(website())
-    result = update_cache(path, session=session, now=paris(2026, 11, 14))
-    assert result == UpdateResult(fdj_draws, 21, True)
+    result = update_cache(path, session=session, now=NOW)
+    assert result == UpdateResult(fdj_draws, 21, 0, True)
     assert len(transport.requests) == 7
     assert load_draws(path) == fdj_draws
 
@@ -772,8 +1099,8 @@ def test_update_cache_adds_the_missing_draws_to_a_stale_cache(
     path = tmp_path / "draws.json"
     save_draws(fdj_draws[:-2], path)  # ends in April 2026
     session, _ = fake_session(website())
-    result = update_cache(path, session=session, now=paris(2026, 11, 14))
-    assert result == UpdateResult(fdj_draws, 2, True)
+    result = update_cache(path, session=session, now=NOW)
+    assert result == UpdateResult(fdj_draws, 2, 0, True)
     assert load_draws(path) == fdj_draws
 
 
@@ -785,7 +1112,7 @@ def test_update_cache_downloads_again_once_a_new_draw_has_taken_place(
     session, transport = fake_session(website())
     # Tuesday the 17th at draw time: FDJ has not published that draw yet.
     result = update_cache(path, session=session, now=paris(2026, 11, 17, 21, 5))
-    assert result == UpdateResult(fdj_draws, 0, True)
+    assert result == UpdateResult(fdj_draws, 0, 0, True)
     assert len(transport.requests) == 7
 
 
@@ -795,33 +1122,87 @@ def test_update_cache_downloads_again_while_the_latest_draw_lacks_its_prizes(
     path = tmp_path / "draws.json"
     save_draws([*fdj_draws[:-1], NEWEST], path)  # up to date, but for the prizes of the 13th
     session, transport = fake_session(website())
-    result = update_cache(path, session=session, now=paris(2026, 11, 14))
-    assert result == UpdateResult(fdj_draws, 0, True)
+    result = update_cache(path, session=session, now=NOW)
+    assert result == UpdateResult(fdj_draws, 0, 1, True)
     assert len(transport.requests) == 7
     assert load_draws(path)[-1].prizes == TYPICAL_PRIZES
 
 
-def test_update_cache_merges_the_download_into_the_cache(
+def test_update_cache_replaces_what_the_download_does_not_confirm(
     fdj_draws: list[Draw], tmp_path: Path
 ) -> None:
     path = tmp_path / "draws.json"
-    only_cached = Draw(dt.date(2020, 2, 7), (1, 2, 3, 4, 5), (1, 2))
-    save_draws([only_cached, NEWEST], path)  # the newest draw was cached without its prizes
+    # A draw that the source has dropped since (a row once misdated, say), another that it
+    # has corrected, and the newest one cached before its prizes were known.
+    dropped = Draw(dt.date(2020, 2, 7), (1, 2, 3, 4, 5), (1, 2))
+    corrected = Draw(dt.date(2026, 11, 10), (1, 2, 3, 4, 5), (1, 2), TYPICAL_PRIZES)
+    save_draws([dropped, corrected, NEWEST], path)
     session, _ = fake_session(website())
     result = update_cache(path, session=session, now=paris(2026, 11, 17, 22))
-    assert result.downloaded
-    assert result.added == 20
-    assert result.draws == merge_draws(fdj_draws, [only_cached])
+    assert result == UpdateResult(fdj_draws, added=19, updated=2, downloaded=True)
     assert result.draws[-1].prizes == TYPICAL_PRIZES
-    assert load_draws(path) == result.draws
+    assert load_draws(path) == fdj_draws
+
+
+def test_update_cache_keeps_the_prizes_that_the_source_no_longer_gives(
+    fdj_draws: list[Draw], tmp_path: Path
+) -> None:
+    path = tmp_path / "draws.json"
+    save_draws(fdj_draws, path)
+    # The newest archive comes back with a blank prize cell in each of its rows.
+    newest_url, name = KNOWN_ARCHIVE_URLS[-1], "euromillions_202002.csv"
+    lines = read_fixture(name).split(b"\n")
+    column = lines[0].decode("utf-8").split(";").index("rapport_du_rang13_Euro_Millions")
+    blanked = [lines[0]]
+    for line in lines[1:]:
+        cells = line.split(b";")
+        if len(cells) > column:
+            cells[column] = b""
+        blanked.append(b";".join(cells))
+    session, _ = fake_session({**website(), newest_url: zip_of({name: b"\n".join(blanked)})})
+    assert [len(draw.prizes) for draw in fetch_draws(session, now=NOW)[-5:]] == [0] * 5
+    result = update_cache(path, force=True, session=session, now=NOW)
+    assert result == UpdateResult(fdj_draws, 0, 0, True)
+    assert load_draws(path) == fdj_draws
+
+
+def test_update_cache_keeps_a_recent_draw_that_the_source_does_not_have_yet(
+    fdj_draws: list[Draw], tmp_path: Path
+) -> None:
+    path = tmp_path / "draws.json"
+    # Cached from a source that was ahead: Tuesday the 17th, and an impossible later date.
+    tuesday = Draw(dt.date(2026, 11, 17), (1, 2, 3, 4, 5), (1, 2), TYPICAL_PRIZES)
+    ghost = Draw(dt.date(2026, 11, 20), (1, 2, 3, 4, 5), (1, 2), TYPICAL_PRIZES)
+    save_draws([*fdj_draws, tuesday, ghost], path)
+    session, _ = fake_session(website())
+    result = update_cache(path, force=True, session=session, now=paris(2026, 11, 18))
+    assert result == UpdateResult([*fdj_draws, tuesday], 0, 0, True)
+    assert load_draws(path) == [*fdj_draws, tuesday]
+
+
+def test_update_cache_downloads_again_when_the_cache_has_a_hole(
+    full_history: list[Draw], strict: None, tmp_path: Path
+) -> None:
+    path = tmp_path / "draws.json"
+    priced = [Draw(d.date, d.numbers, d.stars, TYPICAL_PRIZES) for d in full_history]
+    save_draws(priced, path)
+    session, transport = fake_session(site_serving(full_history))
+    # Complete and up to date: nothing to download.
+    assert update_cache(path, session=session, now=NOW) == UpdateResult(priced, 0, 0, False)
+    assert transport.requests == []
+    # Its newest draw is there, but some forty earlier ones are not.
+    save_draws([*priced[:1200], *priced[1240:]], path)
+    result = update_cache(path, session=session, now=NOW)
+    assert (result.added, result.updated, result.downloaded) == (40, 0, True)
+    assert [draw.date for draw in load_draws(path)] == [draw.date for draw in full_history]
 
 
 def test_update_cache_can_be_forced(fdj_draws: list[Draw], tmp_path: Path) -> None:
     path = tmp_path / "draws.json"
     save_draws(fdj_draws, path)
     session, transport = fake_session(website())
-    result = update_cache(path, force=True, session=session, now=paris(2026, 11, 14))
-    assert result == UpdateResult(fdj_draws, 0, True)
+    result = update_cache(path, force=True, session=session, now=NOW)
+    assert result == UpdateResult(fdj_draws, 0, 0, True)
     assert len(transport.requests) == 7
 
 
@@ -836,16 +1217,29 @@ def test_update_cache_leaves_the_cache_untouched_when_the_download_fails(
     before = path.read_bytes()
     session, _ = fake_session({**website(), KNOWN_ARCHIVE_URLS[-1]: outcome})
     with pytest.raises(FetchError):
-        update_cache(path, session=session, now=paris(2026, 11, 14))
+        update_cache(path, session=session, now=NOW)
     assert path.read_bytes() == before
     assert [entry.name for entry in tmp_path.iterdir()] == ["draws.json"]
+
+
+def test_update_cache_leaves_the_cache_untouched_when_the_download_is_incomplete(
+    full_history: list[Draw], strict: None, tmp_path: Path
+) -> None:
+    path = tmp_path / "draws.json"
+    save_draws(full_history[:-3], path)
+    before = path.read_bytes()
+    # The source only has the last few years left.
+    session, _ = fake_session(site_serving(full_history[1500:]))
+    with pytest.raises(FetchError, match="instead of 2004-02-13"):
+        update_cache(path, session=session, now=NOW)
+    assert path.read_bytes() == before
 
 
 def test_update_cache_reports_a_corrupt_cache_before_downloading(tmp_path: Path) -> None:
     path = tmp_path / "draws.json"
     path.write_text("{")
     session, transport = fake_session(website())
-    with pytest.raises(CacheError):
+    with pytest.raises(CorruptCacheError):
         update_cache(path, force=True, session=session)
     assert transport.requests == []
     assert path.read_text() == "{"

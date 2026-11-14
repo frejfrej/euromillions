@@ -4,8 +4,9 @@ The French operator (FDJ) publishes every draw since 2004 as a handful of zipped
 CSV files linked from its history page. :func:`update_cache` downloads them when
 the local JSON cache may be missing a draw.
 
-Unexpected data raises :class:`FetchError` instead of being skipped: a history
-with missing draws would silently bias every statistic computed from it.
+Unexpected data raises :class:`FetchError` instead of being skipped, and a
+download is only accepted if it is a complete history: missing draws would
+silently bias every statistic computed from it.
 """
 
 from __future__ import annotations
@@ -19,11 +20,13 @@ import json
 import logging
 import os
 import re
-import tempfile
+import secrets
+import stat
+import time
 import zipfile
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -31,7 +34,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from euromillions import __version__, schedule
-from euromillions.models import Draw, PrizeTier
+from euromillions.models import FIRST_DRAW_DATE, Draw, PrizeTier
 
 logger = logging.getLogger(__name__)
 
@@ -58,10 +61,18 @@ DEFAULT_DATA_DIR = Path("data")
 CACHE_FILENAME = "draws.json"
 _CACHE_VERSION = 1
 
-#: Largest HTTP response accepted; the history page weighs 0.8 MB and the archives 0.1 MB.
-_MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024
-#: Largest CSV file accepted once decompressed; the real ones stay under 0.3 MB.
-_MAX_CSV_BYTES = 20 * 1024 * 1024
+# Limits on what a misbehaving server can make this module swallow. The real figures are
+# far below: a 0.8 MB page linking to six archives of 0.1 MB, each holding one CSV file
+# of 0.3 MB at most, all downloaded in a few seconds.
+_MAX_DOWNLOAD_BYTES = 5 * 1024 * 1024
+_MAX_DOWNLOAD_SECONDS = 120.0
+_MAX_ARCHIVES = 20
+_MAX_CSV_FILES = 4
+_MAX_CSV_BYTES = 2 * 1024 * 1024
+
+#: A complete history has no hole longer than this, and ends no longer ago. Two weeks let a
+#: cancelled draw or a late publication through, yet catch a missing archive.
+_MAX_GAP = dt.timedelta(days=14)
 
 _DATE_COLUMN = "date_de_tirage"
 _NUMBER_COLUMNS = ("boule_1", "boule_2", "boule_3", "boule_4", "boule_5")
@@ -76,6 +87,9 @@ _PRIZE_COLUMNS = (
         "rapport_du_rang{rank}_Euro_Millions",
     ),
 )
+#: What every prize column starts with, and how many ranks the game has had (12 until 2011).
+_PRIZE_COLUMN_PREFIX = "rapport_du_rang"
+_RANK_COUNTS = (12, 13)
 
 #: The layouts of ``date_de_tirage``. The patterns are needed because ``strptime`` alone
 #: is lenient about the number of digits.
@@ -90,21 +104,25 @@ _AMOUNT = re.compile(r"[0-9]+([,.][0-9]{1,2})?")
 
 
 class FetchError(Exception):
-    """The draw history could not be downloaded or parsed."""
+    """The draw history could not be downloaded, or is not what it should be."""
 
 
 class CacheError(Exception):
-    """The local cache file is unreadable or corrupt."""
+    """The local cache file cannot be read or written."""
+
+
+class CorruptCacheError(CacheError):
+    """The local cache file exists but does not hold a valid cache."""
 
 
 def parse_csv(content: bytes) -> list[Draw]:
     """Parse one of FDJ's history files and return its draws in file order.
 
     The files are ``;``-separated and their columns changed over the years, so fields are
-    looked up by column name. Each draw comes with the prize tiers of every rank the file
-    has columns for, or with none if its row leaves any of them blank. Blank lines and
-    surplus trailing fields are ignored; anything else that does not yield a valid draw
-    raises :class:`FetchError` naming its line.
+    looked up by column name. Each draw comes with the prize tiers of every rank, or with
+    none if its row leaves any of them blank. Blank lines and surplus trailing fields are
+    ignored; anything else that does not yield a valid draw raises :class:`FetchError`
+    naming its line, and so does a file without any draw.
     """
     # QUOTE_NONE guarantees one row per line. FDJ never quotes fields, and honouring a stray
     # quote character would silently merge all the lines up to the next one into a single row.
@@ -120,16 +138,16 @@ def parse_csv(content: bytes) -> list[Draw]:
             if not any(cells):
                 continue
             if not header:
-                _check_header(cells)
                 header, prize_columns = cells, _prize_columns(cells)
+                _check_header(header, prize_columns)
             else:
                 # Not strict: a row may have surplus trailing fields, or lack its last ones.
                 record = dict(zip(header, cells, strict=False))
                 draws.append(_parse_row(record, prize_columns))
     except (csv.Error, ValueError) as exc:
         raise FetchError(f"line {reader.line_num}: {exc}") from exc
-    if not header:
-        raise FetchError("the file has no header row")
+    if not draws:
+        raise FetchError("the file has no header row" if not header else "the file has no draw")
     return draws
 
 
@@ -143,26 +161,36 @@ def _decode(content: bytes) -> str:
     raise FetchError("the file is neither UTF-8 nor Windows-1252 text")
 
 
-def _check_header(header: list[str]) -> None:
-    missing = [
-        name for name in (_DATE_COLUMN, *_NUMBER_COLUMNS, *_STAR_COLUMNS) if name not in header
-    ]
-    if missing:
-        raise ValueError(f"missing column(s) {', '.join(missing)}")
-
-
 def _prize_columns(header: list[str]) -> list[tuple[str, str]]:
     """Return the ``(winners, prize)`` column names of every prize rank, best rank first.
 
-    The ranks are numbered from 1 and stop at the first one lacking either column.
+    The ranks are numbered from 1 and stop at the first one lacking either column. A file
+    may have no prize column at all, but prize columns that are not understood (renamed, or
+    not as many ranks as the game ever had) are an error: reading them as "no prizes" would
+    quietly discard what the file says.
     """
     names = set(header)
+    columns: list[tuple[str, str]] = []
     for winners, prize in _PRIZE_COLUMNS:
         ranks = ((winners.format(rank=k), prize.format(rank=k)) for k in itertools.count(1))
         columns = list(itertools.takewhile(names.issuperset, ranks))
         if columns:
-            return columns
-    return []
+            break
+    has_prizes = any(name.startswith(_PRIZE_COLUMN_PREFIX) for name in header)
+    if has_prizes and len(columns) not in _RANK_COUNTS:
+        raise ValueError(f"unexpected prize columns ({len(columns)} complete ranks found)")
+    return columns
+
+
+def _check_header(header: list[str], prize_columns: Sequence[tuple[str, str]]) -> None:
+    """Check that every column read from the file is there, and only once."""
+    used = [_DATE_COLUMN, *_NUMBER_COLUMNS, *_STAR_COLUMNS, *itertools.chain(*prize_columns)]
+    missing = [name for name in used if name not in header]
+    if missing:
+        raise ValueError(f"missing column(s) {', '.join(missing)}")
+    repeated = [name for name in used if header.count(name) > 1]
+    if repeated:
+        raise ValueError(f"column(s) {', '.join(repeated)} appear more than once")
 
 
 def _parse_row(record: Mapping[str, str], prize_columns: Sequence[tuple[str, str]]) -> Draw:
@@ -220,19 +248,21 @@ def _parse_amount(text: str) -> float:
 def parse_archive(content: bytes) -> list[Draw]:
     """Parse every CSV file of a zip archive downloaded from FDJ.
 
-    Raises :class:`FetchError` if ``content`` is not a zip archive, holds no CSV file, or
-    holds one that is invalid or suspiciously large.
+    Raises :class:`FetchError` if ``content`` is not a zip archive, holds no CSV file or
+    suspiciously many, or holds one that is invalid or suspiciously large.
     """
     draws: list[Draw] = []
-    found = False
+    found = 0
     for name, data in _csv_files(content):
-        found = True
+        found += 1
+        if found > _MAX_CSV_FILES:
+            raise FetchError(f"the archive contains more than {_MAX_CSV_FILES} CSV files")
         if len(data) > _MAX_CSV_BYTES:
-            raise FetchError(f"{name}: larger than {_MAX_CSV_BYTES} bytes once decompressed")
+            raise FetchError(f"{name!r}: larger than {_MAX_CSV_BYTES} bytes once decompressed")
         try:
             draws.extend(parse_csv(data))
         except FetchError as exc:
-            raise FetchError(f"{name}: {exc}") from exc
+            raise FetchError(f"{name!r}: {exc}") from exc
     if not found:
         raise FetchError("the archive contains no CSV file")
     return draws
@@ -241,13 +271,17 @@ def parse_archive(content: bytes) -> list[Draw]:
 def _csv_files(content: bytes) -> Iterator[tuple[str, bytes]]:
     """Yield ``(name, data)`` for each CSV file of a zip archive.
 
-    No file is inflated beyond ``_MAX_CSV_BYTES + 1`` bytes, whatever size the archive
-    declares for it: the extra byte lets the caller recognise a decompression bomb.
+    Hidden files are skipped, such as the ``__MACOSX/._name.csv`` that macOS adds to the
+    archives it builds. No file is inflated beyond ``_MAX_CSV_BYTES + 1`` bytes, whatever
+    size the archive declares for it: the extra byte lets the caller recognise a
+    decompression bomb.
     """
     try:
         with zipfile.ZipFile(io.BytesIO(content)) as archive:
             for info in archive.infolist():
-                if info.is_dir() or not info.filename.lower().endswith(".csv"):
+                path = PurePosixPath(info.filename)
+                hidden = any(part.startswith((".", "__MACOSX")) for part in path.parts)
+                if info.is_dir() or hidden or path.suffix.lower() != ".csv":
                     continue
                 with archive.open(info) as member:
                     data = member.read(_MAX_CSV_BYTES + 1)
@@ -263,7 +297,8 @@ def discover_archive_urls(session: requests.Session, *, timeout: float = 30.0) -
 
     A link is kept if it points to a file of FDJ's draw information service, over HTTPS,
     and its title, ARIA label or text mentions EuroMillions: the same service publishes
-    the archives of other games.
+    the archives of other games. Raises :class:`FetchError` if the page cannot be read or
+    lists implausibly many archives.
     """
     soup = BeautifulSoup(_download(session, HISTORY_PAGE_URL, timeout=timeout), "html.parser")
     urls = [
@@ -272,7 +307,10 @@ def discover_archive_urls(session: requests.Session, *, timeout: float = 30.0) -
         if _ARCHIVE_URL.fullmatch(url := _attribute(anchor, "href").strip())
         and "euromillions" in _label(anchor).casefold()
     ]
-    return list(dict.fromkeys(urls))
+    unique = list(dict.fromkeys(urls))
+    if len(unique) > _MAX_ARCHIVES:
+        raise FetchError(f"{HISTORY_PAGE_URL} lists {len(unique)} archives: too many to be true")
+    return unique
 
 
 def _attribute(tag: Tag, name: str) -> str:
@@ -287,37 +325,74 @@ def _label(anchor: Tag) -> str:
     )
 
 
-def fetch_draws(session: requests.Session | None = None, *, timeout: float = 30.0) -> list[Draw]:
+def fetch_draws(
+    session: requests.Session | None = None,
+    *,
+    timeout: float = 30.0,
+    now: dt.datetime | None = None,
+) -> list[Draw]:
     """Download the complete draw history, oldest draw first.
 
     The archives are those linked from FDJ's history page or, if that page is unavailable
-    or lists none, :data:`KNOWN_ARCHIVE_URLS`. A partial history is never returned: if any
-    archive cannot be downloaded or parsed, :class:`FetchError` is raised.
+    or lists none, :data:`KNOWN_ARCHIVE_URLS`. A partial or inconsistent history is never
+    returned. :class:`FetchError` is raised if an archive cannot be downloaded or parsed, if
+    two rows disagree about a draw, or if the draws are not the complete schedule up to
+    ``now`` (a timezone-aware datetime, by default the current time): starting with the
+    first draw ever, each on a draw day, without a hole of more than two weeks.
 
     ``timeout`` applies to each request. A ``session`` passed in is used as it is; without
-    one, a temporary session is created that sends a generic User-Agent and retries
-    transient failures.
+    one, a temporary session is created that sends a generic User-Agent, no credentials,
+    and retries transient failures.
     """
     if session is None:
         with _new_session() as own_session:
-            return fetch_draws(own_session, timeout=timeout)
-    groups: list[list[Draw]] = []
+            return fetch_draws(own_session, timeout=timeout, now=now)
+    by_date: dict[dt.date, Draw] = {}
     for url in _archive_urls(session, timeout):
         content = _download(session, url, timeout=timeout)
         try:
-            groups.append(parse_archive(content))
+            for draw in parse_archive(content):
+                known = by_date.setdefault(draw.date, draw)
+                if not _same_balls(known, draw):
+                    raise FetchError(f"two different draws are dated {draw.date}")
+                if draw.prizes and not known.prizes:
+                    by_date[draw.date] = draw
         except FetchError as exc:
             raise FetchError(f"{url}: {exc}") from exc
-    draws = merge_draws(*groups)
-    if not draws:
-        raise FetchError("the history archives hold no draw")
+    draws = [by_date[date] for date in sorted(by_date)]
+    _check_history(draws, now)
     return draws
+
+
+def _same_balls(first: Draw, second: Draw | None) -> bool:
+    return second is not None and (first.numbers, first.stars) == (second.numbers, second.stars)
+
+
+def _check_history(draws: Sequence[Draw], now: dt.datetime | None) -> None:
+    """Raise :class:`FetchError` unless ``draws`` (oldest first) is a complete history."""
+    if not draws:
+        raise FetchError("the history holds no draw")
+    latest = schedule.previous_draw(now).date()
+    for draw in draws:
+        if not schedule.is_draw_day(draw.date):
+            raise FetchError(f"{draw.date} ({draw.date:%A}) is not a draw day")
+        if draw.date > latest:
+            raise FetchError(f"{draw.date} is in the future")
+    if draws[0].date != FIRST_DRAW_DATE:
+        raise FetchError(f"the history starts on {draws[0].date} instead of {FIRST_DRAW_DATE}")
+    for earlier, later in itertools.pairwise(draws):
+        if later.date - earlier.date > _MAX_GAP:
+            raise FetchError(f"the history has no draw between {earlier.date} and {later.date}")
+    if latest - draws[-1].date > _MAX_GAP:
+        raise FetchError(f"the history ends on {draws[-1].date}: its latest draws are missing")
 
 
 def _new_session() -> requests.Session:
     session = requests.Session()
     # Deliberately generic: nothing that identifies the user or the machine.
     session.headers["User-Agent"] = f"euromillions-analyzer/{__version__}"
+    # Without this, requests would look the hosts up in ~/.netrc and send any login found.
+    session.auth = _no_credentials
     # Up to three more attempts, 0.5 to 2 seconds apart, after a connection error or 5xx.
     retries = Retry(
         total=3,
@@ -327,6 +402,10 @@ def _new_session() -> requests.Session:
     )
     session.mount("https://", HTTPAdapter(max_retries=retries))
     return session
+
+
+def _no_credentials(request: requests.PreparedRequest) -> requests.PreparedRequest:
+    return request
 
 
 def _archive_urls(session: requests.Session, timeout: float) -> list[str]:
@@ -345,15 +424,24 @@ def _archive_urls(session: requests.Session, timeout: float) -> list[str]:
 
 
 def _download(session: requests.Session, url: str, *, timeout: float) -> bytes:
-    """GET ``url`` and return the response body, refusing oversized responses."""
+    """GET ``url`` and return the response body.
+
+    Redirects are refused rather than followed to wherever they lead, and so are responses
+    that are too large or take too long (``timeout`` only bounds each wait for data).
+    """
     body = bytearray()
+    deadline = time.monotonic() + _MAX_DOWNLOAD_SECONDS
     try:
-        with session.get(url, timeout=timeout, stream=True) as response:
+        with session.get(url, timeout=timeout, stream=True, allow_redirects=False) as response:
+            if 300 <= response.status_code < 400:
+                raise FetchError(f"{url}: unexpected redirect (HTTP {response.status_code})")
             response.raise_for_status()
             for chunk in response.iter_content(chunk_size=64 * 1024):
                 body += chunk
                 if len(body) > _MAX_DOWNLOAD_BYTES:
                     raise FetchError(f"{url}: response larger than {_MAX_DOWNLOAD_BYTES} bytes")
+                if time.monotonic() > deadline:
+                    raise FetchError(f"{url}: no complete response within the time allowed")
     except requests.RequestException as exc:
         raise FetchError(f"cannot download {url}: {exc}") from exc
     return bytes(body)
@@ -372,46 +460,61 @@ def merge_draws(*groups: Iterable[Draw]) -> list[Draw]:
 def load_draws(path: Path) -> list[Draw]:
     """Read the cached history, oldest draw first; a missing file is an empty history.
 
-    Raises :class:`CacheError` if the file cannot be read or is not a valid cache.
+    Raises :class:`CacheError` if the file cannot be read, and its subclass
+    :class:`CorruptCacheError` if it is not a valid cache.
     """
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        content = path.read_bytes()
     except FileNotFoundError:
         return []
-    except (OSError, ValueError) as exc:
+    except OSError as exc:
         raise CacheError(f"cannot read the draw cache {path}: {exc}") from exc
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except (ValueError, RecursionError) as exc:  # RecursionError: absurdly deep nesting
+        raise CorruptCacheError(f"the draw cache {path} is not valid JSON: {exc}") from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("draws"), list):
-        raise CacheError(f"the draw cache {path} does not have the expected structure")
+        raise CorruptCacheError(f"the draw cache {path} does not have the expected structure")
     if payload.get("version") != _CACHE_VERSION:
-        raise CacheError(
+        raise CorruptCacheError(
             f"the draw cache {path} has unsupported version {payload.get('version')!r}"
         )
     try:
         return merge_draws(Draw.from_dict(record) for record in payload["draws"])
     except ValueError as exc:
-        raise CacheError(f"the draw cache {path} holds an invalid draw: {exc}") from exc
+        raise CorruptCacheError(f"the draw cache {path} holds an invalid draw: {exc}") from exc
 
 
 def save_draws(draws: Iterable[Draw], path: Path) -> None:
     """Write the cache file, creating its directory if needed.
 
-    Draws are stored oldest first, one per date. The file is replaced atomically, so
-    that a failure never leaves a truncated cache behind.
+    Draws are stored oldest first, one per date. The file is replaced atomically, so that
+    a failure never leaves a truncated cache behind; a cache that already exists keeps its
+    permissions, and a symbolic link keeps pointing to the file that is rewritten.
+    Raises :class:`CacheError` if the file cannot be written.
     """
     payload = {
         "version": _CACHE_VERSION,
         "draws": [draw.to_dict() for draw in merge_draws(draws)],
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle, temp_name = tempfile.mkstemp(dir=path.parent, prefix=f"{path.name}.", suffix=".tmp")
+    target = Path(os.path.realpath(path))
+    temporary = target.with_name(f"{target.name}.{secrets.token_hex(8)}.tmp")
     try:
-        with os.fdopen(handle, "w", encoding="utf-8") as temp_file:
-            json.dump(payload, temp_file, separators=(",", ":"))
-        os.replace(temp_name, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(temp_name)
-        raise
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Created like any new file (unlike tempfile, which keeps it private to the user).
+        handle = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as file:
+                json.dump(payload, file, separators=(",", ":"))
+            if target.exists():
+                os.chmod(temporary, stat.S_IMODE(target.stat().st_mode))
+            os.replace(temporary, target)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary)
+            raise
+    except OSError as exc:
+        raise CacheError(f"cannot write the draw cache {path}: {exc}") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,6 +525,8 @@ class UpdateResult:
     draws: list[Draw]
     #: How many of these draws were not in the cache before.
     added: int
+    #: How many were in the cache but have changed, e.g. their prizes were published since.
+    updated: int
     #: False when the cache was already up to date and no request was made.
     downloaded: bool
 
@@ -435,23 +540,41 @@ def update_cache(
 ) -> UpdateResult:
     """Bring the cache at ``path`` up to date and return the resulting history.
 
-    Nothing is downloaded when the cache already holds the latest draw scheduled before
-    ``now`` (a timezone-aware datetime, by default the current time) together with its
-    prizes, unless ``force`` is set. Otherwise the whole history is downloaded and merged
-    into the cache.
+    Nothing is downloaded when the cache is already a complete history up to the latest
+    draw scheduled before ``now`` (a timezone-aware datetime, by default the current time),
+    prizes included, unless ``force`` is set. Otherwise the whole history is downloaded and
+    replaces the cache, which only keeps what the download cannot know: the prizes of a
+    draw it repeats without them, and draws more recent than its last one.
 
     Raises :class:`CacheError` for an unusable cache file, and :class:`FetchError` if the
     download fails, in which case the cache is left untouched.
     """
     cached = load_draws(path)
-    if (
-        cached
-        and not force
-        and cached[-1].date >= schedule.previous_draw(now).date()
-        # A draw may be published before its prizes: look again until they are known.
-        and cached[-1].prizes
-    ):
-        return UpdateResult(cached, 0, False)
-    merged = merge_draws(cached, fetch_draws(session))
+    if not force and _is_current(cached, now):
+        return UpdateResult(cached, 0, 0, False)
+    fetched = fetch_draws(session, now=now)
+    latest = schedule.previous_draw(now).date()
+    before = {draw.date: draw for draw in cached}
+    merged = [
+        # The source sometimes repeats a draw without the prizes it used to publish.
+        before[draw.date] if not draw.prizes and _same_balls(draw, before.get(draw.date)) else draw
+        for draw in fetched
+    ]
+    merged += [draw for draw in cached if fetched[-1].date < draw.date <= latest]
     save_draws(merged, path)
-    return UpdateResult(merged, len(merged) - len(cached), True)
+    return UpdateResult(
+        draws=merged,
+        added=sum(draw.date not in before for draw in merged),
+        updated=sum(before.get(draw.date, draw) != draw for draw in merged),
+        downloaded=True,
+    )
+
+
+def _is_current(cached: Sequence[Draw], now: dt.datetime | None) -> bool:
+    """Tell whether a cached history is complete up to the latest draw, prizes included."""
+    try:
+        _check_history(cached, now)
+    except FetchError:
+        return False
+    # A draw may be published before its prizes: look again until they are known.
+    return cached[-1].date >= schedule.previous_draw(now).date() and bool(cached[-1].prizes)

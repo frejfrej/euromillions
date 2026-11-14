@@ -8,7 +8,6 @@ pool grew over time (which matters when analysing the full draw history).
 from __future__ import annotations
 
 import datetime as dt
-import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -105,13 +104,17 @@ def _normalise(values: Iterable[int], *, count: int, maximum: int, label: str) -
     return tuple(sorted(picked))
 
 
+#: No count of winners or amount in euros comes anywhere near this.
+_MAX_VALUE = 1e12
+
+
 def _is_number(value: object) -> bool:
-    """Tell whether ``value`` is a finite, non-negative real number (and not a bool)."""
+    """Tell whether ``value`` is a real number (not a bool) between 0 and ``_MAX_VALUE``.
+
+    The upper bound also rules out infinity, NaN and integers too large for a float.
+    """
     return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-        and value >= 0
+        isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= _MAX_VALUE
     )
 
 
