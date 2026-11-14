@@ -9,6 +9,7 @@ import pytest
 
 from euromillions.schedule import (
     DRAW_TIMEZONE,
+    TUESDAY_DRAWS_SINCE,
     draw_datetime,
     is_draw_day,
     next_draw,
@@ -39,6 +40,23 @@ def paris(year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> dt
 )
 def test_draws_are_on_tuesdays_and_fridays(day: dt.date, expected: bool) -> None:
     assert is_draw_day(day) is expected
+
+
+@pytest.mark.parametrize(
+    ("day", "expected"),
+    [
+        (dt.date(2004, 2, 6), False),  # the Friday before the first draw
+        (dt.date(2004, 2, 13), True),  # the first draw
+        (dt.date(2005, 3, 1), False),  # a Tuesday of the years with one draw a week
+        (dt.date(2005, 3, 4), True),
+        (dt.date(2011, 5, 3), False),  # the last Tuesday without a draw
+        (dt.date(2011, 5, 10), True),  # the first Tuesday draw
+        (dt.date(1999, 12, 31), False),  # a Friday, long before the game existed
+    ],
+)
+def test_the_schedule_has_a_history(day: dt.date, expected: bool) -> None:
+    assert is_draw_day(day) is expected
+    assert TUESDAY_DRAWS_SINCE == dt.date(2011, 5, 10)
 
 
 def test_draw_datetime_is_evening_in_paris() -> None:
@@ -116,5 +134,8 @@ def test_defaults_to_the_current_time() -> None:
     before = dt.datetime.now(tz=UTC)
     upcoming = next_draw()
     latest = previous_draw()
-    assert latest <= before < upcoming
-    assert (upcoming.date() - latest.date()).days in {3, 4}
+    after = dt.datetime.now(tz=UTC)
+    assert before < upcoming
+    assert latest <= after
+    # Zero days in the unlikely case where a draw took place between the two calls.
+    assert (upcoming.date() - latest.date()).days in {0, 3, 4}

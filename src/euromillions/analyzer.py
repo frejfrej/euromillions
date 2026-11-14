@@ -26,18 +26,21 @@ from dataclasses import dataclass
 from fractions import Fraction
 from itertools import combinations, pairwise
 
+from euromillions.errors import HistoryError
 from euromillions.models import (
     MAIN_COUNT,
-    MAIN_MAX,
-    STAR_MAX,
     BallKind,
     Draw,
+    chronological,
     picks_per_draw,
     pool_size,
 )
 
 #: Main numbers up to this value are "low" (1-25), the others "high" (26-50).
 LOW_MAX = 25
+
+#: How many of the most recent draws tell hot numbers from cold ones, unless told otherwise.
+DEFAULT_WINDOW = 50
 
 #: One draw as seen by one kind of ball: ``(date, balls drawn, pool size)``.
 _Row = tuple[dt.date, tuple[int, ...], int]
@@ -101,9 +104,7 @@ def recent(draws: Iterable[Draw], count: int | None) -> list[Draw]:
     """Return the ``count`` most recent draws in chronological order (``None``: all of them)."""
     if count is not None:
         _require_positive("count", count)
-    # Numbers and stars only break ties between entries sharing a date, so that the result
-    # never depends on the input order.
-    history = sorted(draws, key=lambda draw: (draw.date, draw.numbers, draw.stars))
+    history = chronological(draws)
     return history if count is None else history[-count:]
 
 
@@ -201,13 +202,13 @@ def number_stats(draws: Iterable[Draw], kind: BallKind = "main") -> dict[int, Nu
     """
     picks = picks_per_draw(kind)
     rows: list[_Row] = [
-        (draw.date, _balls(draw, kind), pool_size(kind, draw.date)) for draw in recent(draws, None)
+        (draw.date, _balls(draw, kind), pool_size(kind, draw.date)) for draw in chronological(draws)
     ]
     stats: dict[int, NumberStats] = {}
     # Numbers that joined the pool together were eligible in exactly the same draws: handle
     # each such group in one pass, from the numbers of the smallest pool to today's newest.
     smaller_pool = 0
-    for size in sorted({pool for _, _, pool in rows} | {MAIN_MAX if kind == "main" else STAR_MAX}):
+    for size in sorted({pool for _, _, pool in rows} | {pool_size(kind)}):
         eligible = [row for row in rows if row[2] >= size]
         positions: dict[int, list[int]] = {n: [] for n in range(smaller_pool + 1, size + 1)}
         for index, (_, balls, _) in enumerate(eligible):
@@ -222,7 +223,7 @@ def number_stats(draws: Iterable[Draw], kind: BallKind = "main") -> dict[int, Nu
 
 
 def hot_numbers(
-    draws: Iterable[Draw], kind: BallKind = "main", *, window: int = 50, top: int = 10
+    draws: Iterable[Draw], kind: BallKind = "main", *, window: int = DEFAULT_WINDOW, top: int = 10
 ) -> list[NumberStats]:
     """Return up to ``top`` numbers that came up more often than expected recently.
 
@@ -238,7 +239,7 @@ def hot_numbers(
 
 
 def cold_numbers(
-    draws: Iterable[Draw], kind: BallKind = "main", *, window: int = 50, top: int = 10
+    draws: Iterable[Draw], kind: BallKind = "main", *, window: int = DEFAULT_WINDOW, top: int = 10
 ) -> list[NumberStats]:
     """Return up to ``top`` numbers that came up less often than expected recently.
 
@@ -276,11 +277,10 @@ def pair_counts(draws: Iterable[Draw], kind: BallKind = "main") -> Counter[tuple
     chance in each of them: older draws would favour the pairs of the stars that were
     already in the smaller pools. For main numbers that is every draw.
     """
-    pool = MAIN_MAX if kind == "main" else STAR_MAX
     return Counter(
         pair
-        for draw in recent(draws, None)
-        if pool_size(kind, draw.date) == pool
+        for draw in chronological(draws)  # so that even the order of the counter is fixed
+        if pool_size(kind, draw.date) == pool_size(kind)
         for pair in combinations(_balls(draw, kind), 2)
     )
 
@@ -288,7 +288,7 @@ def pair_counts(draws: Iterable[Draw], kind: BallKind = "main") -> Counter[tuple
 def triplet_counts(draws: Iterable[Draw]) -> Counter[tuple[int, int, int]]:
     """Count how often each ascending triplet of main numbers was drawn together."""
     return Counter(
-        triplet for draw in recent(draws, None) for triplet in combinations(draw.numbers, 3)
+        triplet for draw in chronological(draws) for triplet in combinations(draw.numbers, 3)
     )
 
 
@@ -432,7 +432,7 @@ def typical_longest_gap(kind: BallKind = "main") -> int:
     Under the current rules a number is absent from a draw with probability
     ``1 - picks / pool``, so each gap follows a geometric distribution.
     """
-    pool = MAIN_MAX if kind == "main" else STAR_MAX
+    pool = pool_size(kind)
     absent = 1 - picks_per_draw(kind) / pool
     return math.floor(math.log(1 - 0.5 ** (1 / pool)) / math.log(absent))
 
@@ -483,8 +483,7 @@ def _ranking(
     more = sum(count == entries[-1][1] for _, count in ordered[top:]) if entries else 0
 
     size = len(next(iter(counts), ()))
-    pool = MAIN_MAX if kind == "main" else STAR_MAX
-    possible = math.comb(pool, size)
+    possible = math.comb(pool_size(kind), size)
     per_draw = math.comb(picks_per_draw(kind), size)  # combinations held by each counted draw
     draws = sum(counts.values()) // per_draw if counts else 0
     chance = per_draw / possible
@@ -523,17 +522,20 @@ class AnalysisReport:
     low_counts: dict[int, int]
 
 
-def analyze(draws: Iterable[Draw], *, window: int = 50, top: int = 10) -> AnalysisReport:
+def analyze(
+    draws: Iterable[Draw], *, window: int = DEFAULT_WINDOW, top: int = 10
+) -> AnalysisReport:
     """Run every analysis of this module on ``draws``.
 
     ``window`` is the number of recent draws used for the hot and cold lists, ``top`` the
-    maximum length of every ranking. Raises :class:`ValueError` for an empty history.
+    maximum length of every ranking. Raises :class:`~euromillions.errors.HistoryError` (a
+    :class:`ValueError`) for an empty history.
     """
     _require_positive("window", window)
     _require_positive("top", top)
-    history = recent(draws, None)
+    history = chronological(draws)
     if not history:
-        raise ValueError("cannot analyse an empty draw history")
+        raise HistoryError("cannot analyse an empty draw history")
     return AnalysisReport(
         total_draws=len(history),
         first_date=history[0].date,

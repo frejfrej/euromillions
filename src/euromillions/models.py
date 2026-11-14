@@ -71,9 +71,11 @@ def star_pool_size(on: dt.date) -> int:
     return size
 
 
-def pool_size(kind: BallKind, on: dt.date) -> int:
-    """Return the size of the ``kind`` pool for a draw held on ``on``."""
-    return MAIN_MAX if kind == "main" else star_pool_size(on)
+def pool_size(kind: BallKind, on: dt.date | None = None) -> int:
+    """Return the size of the ``kind`` pool for a draw held on ``on`` (default: today's)."""
+    if kind == "main":
+        return MAIN_MAX
+    return STAR_MAX if on is None else star_pool_size(on)
 
 
 def picks_per_draw(kind: BallKind) -> int:
@@ -206,8 +208,16 @@ class Draw:
                     PrizeTier(winners, prize) for winners, prize in data.get("prizes", ())
                 ),
             )
-        except (KeyError, TypeError, AttributeError) as exc:
+        except (KeyError, TypeError) as exc:
             raise ValueError(f"malformed draw record: {data!r}") from exc
+
+
+def chronological(draws: Iterable[Draw]) -> list[Draw]:
+    """Return the draws oldest first, in an order that does not depend on the input's.
+
+    Numbers and stars only break ties between entries sharing a date.
+    """
+    return sorted(draws, key=lambda draw: (draw.date, draw.numbers, draw.stars))
 
 
 @dataclass(frozen=True, slots=True)

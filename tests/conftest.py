@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import random
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 import pytest
 
@@ -14,11 +14,31 @@ from euromillions.models import (
     STAR_COUNT,
     Draw,
     PrizeTier,
+    Suggestion,
     star_pool_size,
 )
 from euromillions.schedule import is_draw_day
 
 HistoryFactory = Callable[..., list[Draw]]
+
+#: Two lines for the tests that need to know exactly what is played.
+LINE_A = Suggestion((1, 2, 3, 4, 5), (1, 2), "hot")
+LINE_B = Suggestion((1, 2, 3, 4, 6), (1, 3), "hot")
+
+
+class SuggestSpy:
+    """Stands in for ``suggester.suggest``: returns fixed lines and records what it was shown."""
+
+    def __init__(self, lines: list[Suggestion]) -> None:
+        self.lines = lines
+        self.calls: list[list[Draw]] = []
+
+    def __call__(
+        self, draws: Iterable[Draw], strategy: str, *, lines: int, window: int, seed: int | None
+    ) -> list[Suggestion]:
+        self.calls.append(list(draws))
+        return self.lines[:lines]
+
 
 #: The thirteen prize tiers of a real draw (2026-11-13), jackpot first: it was not won.
 TYPICAL_PRIZES: tuple[PrizeTier, ...] = (
@@ -69,9 +89,35 @@ def random_history(
     ]
 
 
+@pytest.fixture(autouse=True)
+def no_data_dir_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the tests away from the cache of whoever runs them."""
+    monkeypatch.delenv("EUROMILLIONS_DATA_DIR", raising=False)
+
+
 @pytest.fixture
 def make_history() -> HistoryFactory:
     return random_history
+
+
+@pytest.fixture
+def scenario() -> list[Draw]:
+    """Four training draws, then three evaluated draws with known outcomes for A and B."""
+    dates = draw_dates(7, dt.date(2020, 1, 3))
+    jackpot_won = (PrizeTier(2, 30_000_000.0), *TYPICAL_PRIZES[1:])
+    training = [
+        Draw(dates[0], (10, 20, 30, 40, 50), (5, 6), jackpot_won),
+        *(Draw(day, (11, 21, 31, 41, 49), (7, 8), TYPICAL_PRIZES) for day in dates[1:4]),
+    ]
+    evaluated = [
+        # A: 2 numbers, B: 2 numbers -> both rank 13.
+        Draw(dates[4], (1, 2, 10, 20, 30), (5, 6), TYPICAL_PRIZES),
+        # A: 3 numbers + 2 stars -> rank 6; B: 3 numbers + 1 star -> rank 9.
+        Draw(dates[5], (1, 2, 3, 40, 41), (1, 2), TYPICAL_PRIZES),
+        # A: 5 numbers + 2 stars -> jackpot, which nobody won; B: 4 numbers + 1 star -> rank 5.
+        Draw(dates[6], (1, 2, 3, 4, 5), (1, 2), TYPICAL_PRIZES),
+    ]
+    return training + evaluated
 
 
 @pytest.fixture

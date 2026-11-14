@@ -341,6 +341,8 @@ def test_parse_csv_tolerates_a_byte_order_mark_blank_lines_and_crlf() -> None:
     assert parse_csv(b"\xef\xbb\xbf" + content) == expected
     assert parse_csv(content.replace(b"\n", b"\r\n")) == expected
     assert parse_csv(b"\n" + content.replace(b"\n", b"\n\n   \n") + b"\n") == expected
+    # The mark must not stick to the name of the first column when that one is read.
+    assert parse_csv(b"\xef\xbb\xbf" + csv_file(HEADER, ROW)) == [NEWEST]
 
 
 def test_parse_csv_needs_only_the_draw_columns() -> None:
@@ -599,6 +601,18 @@ def test_parse_archive_caps_the_decompressed_size(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(fetcher, "_MAX_CSV_BYTES", len(content) - 1)
     with pytest.raises(FetchError, match=r"'euromillions\.csv': larger than \d+ bytes"):
         parse_archive(archive)
+
+
+def test_an_oversized_file_is_never_inflated_in_full(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A megabyte of zeros takes a kilobyte in the archive: its declared size cannot be trusted
+    # and its content must not be read beyond what tells that it is too large.
+    monkeypatch.setattr(fetcher, "_MAX_CSV_BYTES", 1000)
+    bomb = zip_of({"bomb.csv": bytes(1_000_000), "small.csv": b"x" * 10})
+    assert len(bomb) < 2000
+    assert [(name, len(data)) for name, data in fetcher._csv_files(bomb)] == [
+        ("bomb.csv", 1001),
+        ("small.csv", 10),
+    ]
 
 
 def test_parse_archive_names_the_file_and_line_of_an_invalid_row() -> None:
@@ -902,6 +916,8 @@ def test_fetch_draws_uses_a_generic_session_of_its_own(
     retries = adapters[0].max_retries
     assert retries.total == 3
     assert set(retries.status_forcelist or ()) == {500, 502, 503, 504}
+    # A server cannot make the command wait as long as it likes between two attempts.
+    assert retries.respect_retry_after_header is False
     assert len(closed) == 1
 
 

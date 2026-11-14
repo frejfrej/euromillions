@@ -34,6 +34,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from euromillions import __version__, schedule
+from euromillions.errors import EuromillionsError
 from euromillions.models import FIRST_DRAW_DATE, Draw, PrizeTier
 
 logger = logging.getLogger(__name__)
@@ -103,11 +104,11 @@ _DATE_LAYOUTS = (
 _AMOUNT = re.compile(r"[0-9]+([,.][0-9]{1,2})?")
 
 
-class FetchError(Exception):
+class FetchError(EuromillionsError):
     """The draw history could not be downloaded, or is not what it should be."""
 
 
-class CacheError(Exception):
+class CacheError(EuromillionsError):
     """The local cache file cannot be read or written."""
 
 

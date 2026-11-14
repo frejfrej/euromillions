@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from statistics import fmean
 
 from euromillions import suggester
+from euromillions.analyzer import DEFAULT_WINDOW
+from euromillions.errors import HistoryError
 from euromillions.models import (
     CURRENT_RULES_SINCE,
     LINE_PRICE,
@@ -33,11 +35,13 @@ from euromillions.models import (
     BallKind,
     Draw,
     Suggestion,
+    chronological,
     picks_per_draw,
+    pool_size,
 )
 
 #: Name of the baseline that plays uniformly random lines.
-RANDOM = "random"
+RANDOM = suggester.BASELINE
 
 #: What a backtest compares by default: every suggestion strategy, then the baseline.
 DEFAULT_STRATEGIES: tuple[str, ...] = (*suggester.STRATEGIES, RANDOM)
@@ -166,7 +170,7 @@ def backtest(
     *,
     train_fraction: float = 0.8,
     lines: int = 5,
-    window: int = 50,
+    window: int = DEFAULT_WINDOW,
     seed: int | None = None,
     refresh: bool = True,
     line_price: float = LINE_PRICE,
@@ -184,8 +188,12 @@ def backtest(
     had other pools and prize ranks, and only those that carry their prize
     data. ``line_price`` defaults to the price of a line in France, which
     includes a raffle entry that is not simulated here.
+
+    Raises :class:`ValueError` for an invalid argument, and its subclass
+    :class:`~euromillions.errors.HistoryError` when the history cannot be split
+    or evaluated as asked.
     """
-    history = sorted(draws, key=lambda draw: draw.date)
+    history = chronological(draws)
     if not strategies:
         raise ValueError("no strategy to evaluate")
     unknown = [name for name in strategies if name not in DEFAULT_STRATEGIES]
@@ -197,34 +205,30 @@ def backtest(
         raise ValueError(
             f"train_fraction must be between 0 and 1 (exclusive), got {train_fraction}"
         )
-    if lines < 1:
-        raise ValueError(f"lines must be at least 1, got {lines}")
-    if window < 1:
-        raise ValueError(f"window must be at least 1, got {window}")
     if not (line_price > 0 and math.isfinite(line_price)):
         raise ValueError(f"line_price must be a positive amount, got {line_price}")
 
     # The tiny offset keeps e.g. 0.58 * 100 (57.99999999999999 in floating point) at 58 draws.
     split = math.floor(len(history) * train_fraction + 1e-9)
     if split < 1 or split >= len(history):
-        raise ValueError(
+        raise HistoryError(
             f"cannot split {len(history)} draws with a train fraction of {train_fraction}: "
             "both the training and the evaluation set need at least one draw"
         )
     if history[split].date < CURRENT_RULES_SINCE:
         older = sum(draw.date < CURRENT_RULES_SINCE for draw in history)
         if older == len(history):
-            raise ValueError(
+            raise HistoryError(
                 f"no draw is under the current rules ({CURRENT_RULES_SINCE}): nothing to evaluate"
             )
-        raise ValueError(
+        raise HistoryError(
             f"the evaluation would start on {history[split].date}, before the current rules "
             f"({CURRENT_RULES_SINCE}); use a train fraction of at least "
             f"{_round_up(older / len(history))}"
         )
     scored = [index for index in range(split, len(history)) if _is_scorable(history[index])]
     if not scored:
-        raise ValueError(
+        raise HistoryError(
             "none of the draws to evaluate has prize data; run `euromillions fetch --force` "
             "to download it"
         )
@@ -310,11 +314,17 @@ def _play(
     matches: dict[BallKind, int] = {"main": 0, "star": 0}
     variance: dict[BallKind, float] = {"main": 0.0, "star": 0.0}
 
-    played = [] if refresh else _suggest(strategy, history[:split], lines, window, rng)
+    def suggest(known: list[Draw]) -> list[Suggestion]:
+        """Return the lines the strategy plays when only the ``known`` draws have happened."""
+        return suggester.suggest(
+            known, strategy, lines=lines, window=window, seed=rng.getrandbits(64)
+        )
+
+    played = [] if refresh else suggest(history[:split])
     for index in scored:
         draw = history[index]
         if refresh:
-            played = _suggest(strategy, history[:index], lines, window, rng)
+            played = suggest(history[:index])
 
         ranks = []
         for line in played:
@@ -358,22 +368,6 @@ def _play(
     )
 
 
-def _suggest(
-    strategy: str, known: list[Draw], lines: int, window: int, rng: random.Random
-) -> list[Suggestion]:
-    """Return the lines ``strategy`` plays when only the ``known`` draws have happened."""
-    if strategy != RANDOM:
-        return suggester.suggest(
-            known, strategy, lines=lines, window=window, seed=rng.getrandbits(64)
-        )
-    picked: dict[Suggestion, None] = {}
-    while len(picked) < lines:
-        numbers = rng.sample(range(1, MAIN_MAX + 1), MAIN_COUNT)
-        stars = rng.sample(range(1, STAR_MAX + 1), STAR_COUNT)
-        picked.setdefault(Suggestion(tuple(numbers), tuple(stars), RANDOM))
-    return list(picked)
-
-
 def _chance_variance(played: Sequence[Suggestion], kind: BallKind) -> float:
     """Variance, under a fair draw, of the total number of ``kind`` matches of ``played``.
 
@@ -381,7 +375,7 @@ def _chance_variance(played: Sequence[Suggestion], kind: BallKind) -> float:
     Balls are drawn without replacement, so with ``p = picks / pool`` each indicator
     has variance ``p(1 - p)`` and two of them have covariance ``-p(1 - p) / (pool - 1)``.
     """
-    pool = MAIN_MAX if kind == "main" else STAR_MAX
+    pool = pool_size(kind)
     p = picks_per_draw(kind) / pool
     counts = Counter(
         ball for line in played for ball in (line.numbers if kind == "main" else line.stars)

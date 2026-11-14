@@ -28,6 +28,7 @@ euromillions/
 │   └── euromillions/
 │       ├── __init__.py
 │       ├── __main__.py     # `python -m euromillions`
+│       ├── errors.py       # Errors raised on purpose (reported without a traceback)
 │       ├── models.py       # Game rules and data models (Draw, PrizeTier, Suggestion)
 │       ├── schedule.py     # Draw schedule (next / previous draw)
 │       ├── fetcher.py      # Download, parse and cache the draw history
@@ -59,14 +60,16 @@ Compute the following statistics over the full history and configurable recent w
 | Metric | Description |
 |---|---|
 | **Frequency analysis** | How often each number (1–50) and star (1–12) has appeared |
-| **Hot numbers** | Numbers appearing significantly more than average recently |
-| **Cold numbers** | Numbers appearing significantly less than average recently |
+| **Hot numbers** | Numbers that came up more often than expected in the recent window, ranked by z-score (how many standard deviations above expectation) |
+| **Cold numbers** | Numbers that came up less often than expected in the recent window, ranked the same way |
 | **Overdue numbers** | Numbers with the longest gap since last appearance |
 | **Pair / triplet frequency** | Most common 2- and 3-number combinations |
 | **Consecutive number analysis** | How often consecutive numbers appear together |
 | **Sum & range analysis** | Distribution of the sum and range (max − min) of drawn numbers |
 | **Odd/even & high/low ratios** | Distribution patterns (e.g., 3 odd + 2 even is most common) |
-| **Gap analysis** | Average interval between appearances for each number |
+| **Gap analysis** | Average number of draws without the number between two appearances, for each number |
+
+Every per-number figure only counts the draws in which the number was in the pool, so that stars 10–12 are compared with what they could do. Every ranking comes with what fair draws alone typically produce (most extreme z-score, longest absence, luckiest pair), because extremes look meaningful even when they are not. `analyze --full` adds the table of every number and star, and the full distributions.
 
 ### Phase 3 — Number Suggestion (`suggester.py`)
 
@@ -86,20 +89,25 @@ Simple command-line tool using `argparse` or `click`:
 
 ```
 # Update local data cache
-python -m euromillions fetch
+python -m euromillions fetch [--force]
 
 # Show analysis summary
-python -m euromillions analyze [--last N]
+python -m euromillions analyze [--last N] [--window 50] [--top 10] [--full]
 
 # Suggest numbers
 python -m euromillions suggest [--strategy hot|cold|balanced|weighted|anti] [--lines 5]
+                               [--window 50] [--seed N]
 
 # Evaluate the strategies on held-out draws
-python -m euromillions backtest [--strategy NAME] [--train-fraction 0.8] [--lines 5] [--static]
+python -m euromillions backtest [--strategy NAME ...] [--train-fraction 0.8] [--lines 5]
+                                [--window 50] [--seed N] [--static] [--price 2.5]
 
 # Show next draw date
 python -m euromillions next-draw
 ```
+
+The cache is `data/draws.json` under the current directory; another directory can be given
+with `--data-dir DIR` (before the command) or the `EUROMILLIONS_DATA_DIR` variable.
 
 ### Phase 5 — Tests
 
@@ -113,7 +121,8 @@ Check the hypotheses behind the strategies on data they have not seen, and measu
 - Split the history: the oldest part (80% by default) only serves to build statistics, the rest is the evaluation set.
 - Play every evaluated draw with lines suggested from the draws that precede it (statistics updated before each draw, or frozen on the training set with `--static`). No line ever depends on the draw it is scored on.
 - Score the lines with the prizes really paid that day for each rank, shared with the actual winners; report cost, winnings, net result and return on stake per strategy.
-- Compare every strategy with a uniformly random baseline and with pure chance: share of winning lines, average numbers and stars matched per line, with exact z-scores. A strategy with predictive power would stand out; random draws leave them all within noise.
+- Compare every strategy with a uniformly random baseline and with pure chance: expected winnings of random lines on the same draws (with their standard deviation), share of winning lines, average numbers and stars matched per line with exact z-scores, wins per prize rank.
+- Say how to read the result: with a dozen z-scores on screen, one beyond ±2 is expected in about four backtests out of ten; only a much larger value that holds across seeds and periods would point to predictive power. On the real history, every strategy loses about 80% of the stakes, like random lines.
 - Only draws under the current rules (since 27 September 2016) are evaluated, as earlier ones had other star pools and prize ranks.
 
 ---
@@ -122,9 +131,10 @@ Check the hypotheses behind the strategies on data they have not seen, and measu
 
 | Package | Purpose |
 |---|---|
-| `requests` | HTTP fetching |
+| `requests`, `urllib3` | HTTP fetching, with retries |
 | `beautifulsoup4` | HTML parsing (archive links on the history page) |
 | `click` | CLI framework |
+| `tzdata` | Time zone data for the draw schedule (Paris time) |
 | `pytest`, `ruff`, `mypy` | Testing, linting, type checking (dev) |
 
 The analysis uses the standard library only (no `pandas`).

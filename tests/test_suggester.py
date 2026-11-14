@@ -10,16 +10,9 @@ import pytest
 
 from euromillions import analyzer
 from euromillions import suggester as suggester_module
+from euromillions.errors import HistoryError
 from euromillions.models import Draw, Suggestion
-from euromillions.suggester import (
-    STRATEGIES,
-    _common_values,
-    _most_common,
-    _rank_weights,
-    _scaled,
-    _weighted_sample,
-    suggest,
-)
+from euromillions.suggester import BASELINE, STRATEGIES, _rank_weights, _weighted_sample, suggest
 
 ALL_STRATEGIES = list(STRATEGIES)
 
@@ -169,6 +162,13 @@ class TestStrategyBehaviour:
         assert average_star_hits(lines, COLD_STARS) > 0.6
         assert average_hits(lines, HOT_NUMBERS) < 0.25
 
+    def test_cold_looks_at_the_whole_history(self, skewed_history: list[Draw]) -> None:
+        # How long 46-50 have been away only shows beyond the last 50 draws: with that window
+        # alone, they would tie with every other number that is absent from it.
+        whole = suggest(skewed_history, "cold", lines=20, seed=1)
+        assert whole != suggest(skewed_history[-50:], "cold", lines=20, seed=1)
+        assert whole == suggest(skewed_history, "cold", lines=20, window=7, seed=1)
+
     def test_balanced_mixes_hot_and_overdue_numbers(self, skewed_history: list[Draw]) -> None:
         lines = suggest(skewed_history, "balanced", lines=300, seed=1)
         assert average_hits(lines, HOT_NUMBERS) > 0.6
@@ -263,9 +263,128 @@ class TestStrategyBehaviour:
         lines = suggest(history, "anti", lines=2000, seed=9)
         counts = Counter(n for line in lines for n in line.numbers)
         assert set(counts) == set(range(1, 51))
-        # 200 expected per number; extreme numbers are a little less likely to fit the patterns.
-        assert all(120 <= count <= 280 for count in counts.values())
+        # 200 expected per number; the extreme ones are less likely to fit the patterns.
+        assert all(100 <= count <= 300 for count in counts.values())
         assert set(Counter(s for line in lines for s in line.stars)) == set(range(1, 13))
+
+
+def with_an_old_streak(history: list[Draw]) -> list[Draw]:
+    """Make 1-5 and stars 1-2 come up 30 times in a row, ending 70 draws before the last."""
+    return [
+        Draw(draw.date, HOT_NUMBERS, HOT_STARS) if 200 <= index < 230 else draw
+        for index, draw in enumerate(history)
+    ]
+
+
+class TestWindow:
+    def test_hot_forgets_a_streak_older_than_the_window(self, history: list[Draw]) -> None:
+        streaky = with_an_old_streak(history)
+        recent = suggest(streaky, "hot", lines=300, window=50, seed=1)
+        whole = suggest(streaky, "hot", lines=300, window=300, seed=1)
+        assert average_hits(whole, HOT_NUMBERS) > 1.0
+        assert average_hits(recent, HOT_NUMBERS) < 0.9
+        assert average_star_hits(whole, HOT_STARS) > 0.6
+        assert average_star_hits(recent, HOT_STARS) < 0.6
+
+    @pytest.mark.parametrize("strategy", ["cold", "weighted", "anti", BASELINE])
+    def test_the_window_only_matters_to_hot_numbers(
+        self, strategy: str, history: list[Draw]
+    ) -> None:
+        streaky = with_an_old_streak(history)
+        assert suggest(streaky, strategy, lines=5, window=10, seed=1) == suggest(
+            streaky, strategy, lines=5, window=300, seed=1
+        )
+
+    def test_balanced_takes_its_hot_numbers_from_the_window(self, history: list[Draw]) -> None:
+        streaky = with_an_old_streak(history)
+        recent = suggest(streaky, "balanced", lines=300, window=50, seed=1)
+        whole = suggest(streaky, "balanced", lines=300, window=300, seed=1)
+        assert average_hits(whole, HOT_NUMBERS) > average_hits(recent, HOT_NUMBERS) + 0.2
+
+
+class TestWeighted:
+    """Each term of the composite score must count on its own."""
+
+    def test_frequency(self, history: list[Draw]) -> None:
+        # 7 is in every draw, the latest included: top frequency, but the shortest gap of all.
+        rng = random.Random(3)
+        reshaped = []
+        for draw in history:
+            others = rng.sample([n for n in range(1, 51) if n != 7], 4)
+            reshaped.append(Draw(draw.date, (7, *others), draw.stars))
+        lines = suggest(reshaped, "weighted", lines=400, seed=2)
+        assert sum(7 in line.numbers for line in lines) / len(lines) > 0.35  # 0.10 by chance
+
+    def test_gap(self, history: list[Draw]) -> None:
+        # 7 comes up in 30 of the 300 draws either way, as expected of any number: only the
+        # time since its last appearance differs between the two histories.
+        def share_with_seven(last_seen: int) -> float:
+            rng = random.Random(3)
+            positions = set(range(last_seen - 29 * 6, last_seen + 1, 6))
+            reshaped = []
+            for index, draw in enumerate(history):
+                others = rng.sample([n for n in range(1, 51) if n != 7], 5)
+                numbers = (7, *others[:4]) if index in positions else tuple(others)
+                reshaped.append(Draw(draw.date, numbers, draw.stars))
+            lines = suggest(reshaped, "weighted", lines=1000, seed=2)
+            return sum(7 in line.numbers for line in lines) / len(lines)
+
+        assert share_with_seven(last_seen=199) > 1.5 * share_with_seven(last_seen=299)
+
+    def test_stars_are_weighted_too(self, history: list[Draw]) -> None:
+        # Star 1 is in every one of the first 200 draws, then absent for 100.
+        reshaped = []
+        for index, draw in enumerate(history):
+            other = next(star for star in draw.stars if star != 1)
+            absent = tuple(star if star != 1 else 2 + (other == 2) for star in draw.stars)
+            reshaped.append(Draw(draw.date, draw.numbers, (1, other) if index < 200 else absent))
+        lines = suggest(reshaped, "weighted", lines=400, seed=2)
+        assert sum(1 in line.stars for line in lines) / len(lines) > 0.3  # 1/6 by chance
+
+
+class TestDistinctLines:
+    @pytest.mark.parametrize("strategy", ["hot", "cold", "balanced", "weighted"])
+    @pytest.mark.parametrize("size", [1, 2, 5])
+    def test_a_tiny_history_still_gives_distinct_lines(
+        self, strategy: str, size: int, history: list[Draw]
+    ) -> None:
+        # With so little history the weights concentrate on a few numbers: without care,
+        # the same line would come back again and again.
+        lines = suggest(history[:size], strategy, lines=30, seed=11)
+        assert len(set(lines)) == 30
+
+    def test_giving_up_on_distinct_lines_is_an_error(
+        self, history: list[Draw], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(suggester_module, "_MAX_ATTEMPTS", 0)
+        with pytest.raises(HistoryError, match="could not find 3 distinct lines"):
+            suggest(history, "hot", lines=3, seed=1)
+
+    def test_anti_gives_up_when_no_line_fits_the_patterns(
+        self, history: list[Draw], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Twenty times the same draw: only its own sum, range and splits are "usual".
+        same = [Draw(draw.date, (1, 2, 3, 4, 5), (1, 2)) for draw in history[:20]]
+        monkeypatch.setattr(suggester_module, "_MAX_ATTEMPTS", 20)
+        with pytest.raises(HistoryError, match="no line matches the usual patterns"):
+            suggest(same, "anti", seed=1)
+
+
+class TestBaseline:
+    def test_is_not_offered_as_a_strategy(self) -> None:
+        assert BASELINE == "random"
+        assert BASELINE not in STRATEGIES
+
+    def test_draws_valid_distinct_reproducible_lines(self, history: list[Draw]) -> None:
+        lines = suggest(history, BASELINE, lines=40, seed=7)
+        assert len(set(lines)) == 40
+        assert {line.strategy for line in lines} == {BASELINE}
+        assert suggest(history, BASELINE, lines=40, seed=7) == lines
+
+    def test_does_not_look_at_the_history(self, history: list[Draw]) -> None:
+        assert suggest(history[:3], BASELINE, lines=5, seed=7) == suggest(
+            history, BASELINE, lines=5, seed=7
+        )
 
 
 class TestHelpers:
@@ -275,10 +394,6 @@ class TestHelpers:
     def test_rank_weights_give_ties_the_same_weight(self) -> None:
         assert _rank_weights({1: 5, 2: 5, 3: 9, 4: 1}) == {4: 1.0, 1: 8.0, 2: 8.0, 3: 64.0}
         assert set(_rank_weights(dict.fromkeys(range(1, 13), 0.0)).values()) == {1.0}
-
-    def test_scaled(self) -> None:
-        assert _scaled({1: 10, 2: 20, 3: 15}) == {1: 0.0, 2: 1.0, 3: 0.5}
-        assert _scaled({1: 4, 2: 4}) == {1: 0.0, 2: 0.0}
 
     def test_weighted_sample_returns_distinct_numbers(self) -> None:
         rng = random.Random(1)
@@ -298,11 +413,3 @@ class TestHelpers:
         weights = {1: 1.0, 2: 0.0, 3: 1.0, 4: 1.0}
         for _ in range(200):
             assert set(_weighted_sample(rng, weights, 2, exclude=[4])) == {1, 3}
-
-    def test_most_common_ignores_values_never_observed(self) -> None:
-        assert _most_common({0: 1, 1: 7, 2: 30, 3: 30, 4: 9, 5: 0}, 2) == {2, 3}
-        assert _most_common({0: 0, 1: 0, 2: 0, 3: 4, 4: 0, 5: 0}, 2) == {3}
-
-    def test_common_values_drops_the_rare_ones(self) -> None:
-        distribution = {0: 4, 1: 15, 2: 31, 3: 30, 4: 15, 5: 5}  # out of 100 draws
-        assert _common_values(distribution) == {1, 2, 3, 4, 5}

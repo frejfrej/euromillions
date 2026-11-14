@@ -7,6 +7,8 @@ import json
 
 import pytest
 
+from euromillions.errors import EuromillionsError, HistoryError
+from euromillions.fetcher import CacheError, CorruptCacheError, FetchError
 from euromillions.models import (
     CURRENT_RULES_SINCE,
     FIRST_DRAW_DATE,
@@ -15,6 +17,7 @@ from euromillions.models import (
     Draw,
     PrizeTier,
     Suggestion,
+    chronological,
     format_line,
     picks_per_draw,
     pool_size,
@@ -48,6 +51,10 @@ class TestPools:
         assert pool_size("main", CURRENT) == 50
         assert pool_size("star", dt.date(2005, 1, 7)) == 9
         assert pool_size("star", CURRENT) == 12
+
+    def test_pool_size_defaults_to_the_current_rules(self) -> None:
+        assert pool_size("main") == 50
+        assert pool_size("star") == 12
 
     def test_picks_per_draw(self) -> None:
         assert picks_per_draw("main") == 5
@@ -274,6 +281,24 @@ class TestSuggestion:
     def test_rejects_invalid_lines(self, numbers: tuple[int, ...], stars: tuple[int, ...]) -> None:
         with pytest.raises(ValueError):
             Suggestion(numbers, stars, strategy="hot")
+
+
+def test_chronological_does_not_depend_on_the_order_given() -> None:
+    first = Draw(dt.date(2024, 7, 19), (1, 2, 3, 4, 5), (1, 2))
+    second = Draw(dt.date(2024, 7, 23), (1, 2, 3, 4, 5), (1, 2))
+    same_day = Draw(dt.date(2024, 7, 23), (1, 2, 3, 4, 6), (1, 2))
+    assert chronological([same_day, second, first]) == [first, second, same_day]
+    assert chronological(iter([second, same_day, first])) == [first, second, same_day]
+    assert chronological([]) == []
+
+
+def test_errors_raised_on_purpose_share_a_base() -> None:
+    for error in (FetchError, CacheError, CorruptCacheError, HistoryError):
+        assert issubclass(error, EuromillionsError)
+    assert issubclass(CorruptCacheError, CacheError)
+    # A history that cannot support a request is also a bad value for whoever passed it.
+    assert issubclass(HistoryError, ValueError)
+    assert not issubclass(FetchError, ValueError)
 
 
 def test_format_line_zero_pads() -> None:

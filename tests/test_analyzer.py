@@ -831,7 +831,7 @@ class TestAnalyze:
             assert ranked.more == sum(count == ranking[-1][1] for count in counts.values()) - sum(
                 count == ranking[-1][1] for _, count in ranking
             )
-            assert all(counts[combination] == count for combination, count in ranking)
+            assert all((combination, count) in counts.items() for combination, count in ranking)
             # Sorted by decreasing count, then ascending combination...
             assert ranking == sorted(ranking, key=lambda item: (-item[1], item[0]))
             # ... and nothing left out ranks before the last entry.
@@ -962,9 +962,10 @@ class TestSyntheticHistory:
         assert consecutive.draws_with_consecutive == 300 - consecutive.pair_count_distribution[0]
 
     def test_hot_and_cold_lists_are_consistent(self) -> None:
-        for kind in ("main", "star"):
-            hot = hot_numbers(SYNTHETIC, kind, window=60, top=50)  # type: ignore[arg-type]
-            cold = cold_numbers(SYNTHETIC, kind, window=60, top=50)  # type: ignore[arg-type]
+        kinds: tuple[BallKind, BallKind] = ("main", "star")
+        for kind in kinds:
+            hot = hot_numbers(SYNTHETIC, kind, window=60, top=50)
+            cold = cold_numbers(SYNTHETIC, kind, window=60, top=50)
             assert all(entry.z_score > 0 and entry.count > entry.expected for entry in hot)
             assert all(entry.z_score < 0 and entry.count < entry.expected for entry in cold)
             assert [e.z_score for e in hot] == sorted((e.z_score for e in hot), reverse=True)

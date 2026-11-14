@@ -13,6 +13,7 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import NamedTuple
 
 from euromillions import analyzer
+from euromillions.errors import HistoryError
 from euromillions.models import (
     MAIN_COUNT,
     MAIN_MAX,
@@ -40,6 +41,10 @@ _BASE_WEIGHT = 0.1
 
 #: Candidate lines tried before giving up on the pattern constraints of a strategy.
 _MAX_ATTEMPTS = 1_000
+
+#: Name of the baseline: uniformly random lines. It is no strategy worth suggesting, but
+#: the yardstick that a backtest compares the strategies with.
+BASELINE = "random"
 
 _KINDS: tuple[BallKind, BallKind] = ("main", "star")
 
@@ -80,6 +85,14 @@ def _weighted_sample(
         picked.append(choice)
         del remaining[choice]
     return picked
+
+
+def _uniform_line(rng: random.Random) -> _Line:
+    """Draw a line the way the machine does: every line is equally likely."""
+    return (
+        rng.sample(range(1, MAIN_MAX + 1), MAIN_COUNT),
+        rng.sample(range(1, STAR_MAX + 1), STAR_COUNT),
+    )
 
 
 def _most_common(distribution: Mapping[int, int], count: int) -> frozenset[int]:
@@ -135,7 +148,7 @@ def _hot(draws: list[Draw], window: int) -> _Generator:
     return _from_weights(_hot_weights(draws, window))
 
 
-def _cold(draws: list[Draw], window: int) -> _Generator:
+def _cold(draws: list[Draw], _window: int) -> _Generator:
     return _from_weights(_cold_weights(draws))
 
 
@@ -164,7 +177,7 @@ def _balanced(draws: list[Draw], window: int) -> _Generator:
     return generate
 
 
-def _weighted(draws: list[Draw], window: int) -> _Generator:
+def _weighted(draws: list[Draw], _window: int) -> _Generator:
     base: dict[BallKind, _Weights] = {}
     pairs = {kind: analyzer.pair_counts(draws, kind) for kind in _KINDS}
     for kind in _KINDS:
@@ -188,9 +201,9 @@ def _weighted(draws: list[Draw], window: int) -> _Generator:
     return lambda rng: (pick(rng, "main"), pick(rng, "star"))
 
 
-def _anti(draws: list[Draw], window: int) -> _Generator:
+def _anti(draws: list[Draw], _window: int) -> _Generator:
     if len(draws) < _MIN_PATTERN_HISTORY:
-        raise ValueError(
+        raise HistoryError(
             f"the anti strategy needs at least {_MIN_PATTERN_HISTORY} draws of history, "
             f"got {len(draws)}"
         )
@@ -202,7 +215,7 @@ def _anti(draws: list[Draw], window: int) -> _Generator:
 
     def generate(rng: random.Random) -> _Line:
         for _ in range(_MAX_ATTEMPTS):
-            numbers = rng.sample(range(1, MAIN_MAX + 1), MAIN_COUNT)
+            numbers, stars = _uniform_line(rng)
             if (
                 low_sum <= sum(numbers) <= high_sum
                 and low_range <= max(numbers) - min(numbers) <= high_range
@@ -210,10 +223,14 @@ def _anti(draws: list[Draw], window: int) -> _Generator:
                 and analyzer.low_count(numbers) in common_low
                 and analyzer.longest_run(numbers) in common_runs
             ):
-                return numbers, rng.sample(range(1, STAR_MAX + 1), STAR_COUNT)
-        raise RuntimeError("no line matches the usual patterns of past draws")
+                return numbers, stars
+        raise HistoryError("no line matches the usual patterns of the past draws")
 
     return generate
+
+
+def _random(_draws: list[Draw], _window: int) -> _Generator:
+    return _uniform_line
 
 
 class _Strategy(NamedTuple):
@@ -227,10 +244,13 @@ _STRATEGIES: dict[str, _Strategy] = {
     "balanced": _Strategy("hot and overdue numbers, usual odd/even and low/high mix", _balanced),
     "weighted": _Strategy("weight numbers by frequency, overdue gap and pair affinity", _weighted),
     "anti": _Strategy("uniformly random lines that avoid historically rare patterns", _anti),
+    BASELINE: _Strategy("uniformly random lines", _random),
 }
 
-#: Available strategies: name -> one-line description.
-STRATEGIES: dict[str, str] = {name: strategy.description for name, strategy in _STRATEGIES.items()}
+#: The strategies on offer: name -> one-line description.
+STRATEGIES: dict[str, str] = {
+    name: strategy.description for name, strategy in _STRATEGIES.items() if name != BASELINE
+}
 
 
 def suggest(
@@ -238,7 +258,7 @@ def suggest(
     strategy: str = "balanced",
     *,
     lines: int = 1,
-    window: int = 50,
+    window: int = analyzer.DEFAULT_WINDOW,
     seed: int | None = None,
 ) -> list[Suggestion]:
     """Suggest ``lines`` distinct lines for the next draw.
@@ -259,16 +279,22 @@ def suggest(
     * ``anti`` draws uniformly random lines and rejects those whose sum, range,
       odd/even split, low/high split or run of consecutive numbers is rare in
       the history.
+
+    :data:`BASELINE` is accepted as well, for comparisons: uniformly random lines.
+
+    Raises :class:`ValueError` for an invalid argument, and its subclass
+    :class:`~euromillions.errors.HistoryError` when the history is empty or too
+    short for the strategy.
     """
     if strategy not in _STRATEGIES:
-        raise ValueError(f"unknown strategy {strategy!r}; choose from {', '.join(_STRATEGIES)}")
+        raise ValueError(f"unknown strategy {strategy!r}; choose from {', '.join(STRATEGIES)}")
     if lines < 1:
         raise ValueError(f"lines must be at least 1, got {lines}")
     if window < 1:
         raise ValueError(f"window must be at least 1, got {window}")
     history = list(draws)
     if not history:
-        raise ValueError("cannot suggest numbers without any draw history")
+        raise HistoryError("cannot suggest numbers without any draw history")
 
     generate = _STRATEGIES[strategy].build(history, window)
     rng = random.Random(seed)
@@ -278,4 +304,4 @@ def suggest(
         suggestions.setdefault(Suggestion(tuple(numbers), tuple(stars), strategy))
         if len(suggestions) == lines:
             return list(suggestions)
-    raise RuntimeError(f"could not find {lines} distinct lines with strategy {strategy!r}")
+    raise HistoryError(f"could not find {lines} distinct lines with strategy {strategy!r}")

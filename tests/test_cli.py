@@ -3,22 +3,140 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 from click.testing import CliRunner, Result
 
-from euromillions import __version__, fetcher, schedule
+from euromillions import __version__, backtest, fetcher, schedule, suggester
 from euromillions.cli import DISCLAIMER, _describe_draw, _format_countdown, _ranking, cli
 from euromillions.models import Draw, PrizeTier
 
-from .conftest import TYPICAL_PRIZES, HistoryFactory
+from .conftest import LINE_A, LINE_B, TYPICAL_PRIZES, HistoryFactory, SuggestSpy
+from .test_analyzer import HISTORY as SIX_DRAWS
 
 LINE_PATTERN = re.compile(r"^ +\d+\.  (\d\d ){5}\| stars \d\d \d\d$", re.MULTILINE)
 PARIS = schedule.DRAW_TIMEZONE
+SOURCES = Path(__file__).resolve().parents[1] / "src"
+
+# What the commands print for histories small enough to check every figure by hand: the six
+# draws of the analyzer tests, and the backtest scenario shared with the backtest tests.
+
+ANALYSIS_OF_SIX_DRAWS = """\
+EuroMillions analysis: 6 draws from 2024-01-02 to 2024-01-19
+
+MAIN NUMBERS (5 drawn from 1-50)
+  Most drawn        7 (3x, +3.3)  21 (3x, +3.3)  35 (3x, +3.3)
+  Least drawn       4 (0x, -0.8)  6 (0x, -0.8)  16 (0x, -0.8)
+  Hot, last 4       7 (2x, +2.7)  21 (2x, +2.7)  35 (2x, +2.7)
+  Cold, last 4      1 (0x, -0.7)  2 (0x, -0.7)  3 (0x, -0.7)
+  Most overdue      4 (6 draws)  6 (6 draws)  16 (6 draws)
+  In brackets: times drawn, then z-score (distance to the expected count, in
+  standard deviations). Fair draws typically put the most extreme of 50 z-scores
+  near +/-2.5 and the longest current absence near 40 draws.
+
+LUCKY STARS (2 drawn from 1-12)
+  Most drawn        2 (4x, +3.3)  1 (3x, +2.2)  3 (2x, +1.1)
+  Least drawn       6 (0x, -1.1)  7 (0x, -1.1)  8 (0x, -1.1)
+  Hot, last 4       2 (3x, +3.1)  1 (2x, +1.8)  3 (1x, +0.4)
+  Cold, last 4      4 (0x, -0.9)  6 (0x, -0.9)  7 (0x, -0.9)
+  Most overdue      6 (6 draws)  7 (6 draws)  8 (6 draws)
+  In brackets: times drawn, then z-score (distance to the expected count, in
+  standard deviations). Fair draws typically put the most extreme of 12 z-scores
+  near +/-1.9 and the longest current absence near 15 draws.
+
+COMBINATIONS DRAWN TOGETHER
+  Top pairs         7-21 (3x)  7-35 (2x)  21-35 (2x)
+  Top triplets      7-21-35 (2x)  1-2-3 (1x)  1-2-9 (1x)  +56 more at 1x
+  Top star pairs    1-2 (2x)  1-5 (1x)  2-3 (1x)  +2 more at 1x
+  By chance a given pair is expected 0.0 times and the luckiest one about 2; a
+  triplet 0.0 and 1; a star pair 0.1 and 1 (star pairs: draws with 12 stars
+  only).
+
+PATTERNS OF THE MAIN NUMBERS
+  Sum               mean 102.8  median 115  min 35  max 131
+                    100% of draws between 35 and 131
+  Range (max-min)   mean 35.0  median 39.5  min 19  max 43
+                    100% of draws between 19 and 43
+  Consecutive       66.7% of draws contain consecutive numbers
+  Odd/even          3/2 (66.7%)  5/0 (16.7%)  2/3 (16.7%)
+  Low/high (1-25)   3/2 (66.7%)  5/0 (16.7%)  4/1 (16.7%)
+"""
+
+FIRST_NUMBERS_OF_SIX_DRAWS = """\
+MAIN NUMBERS
+   No  Drawn  Freq %  Expected       z  Avg gap  Gap now  Max gap  Last seen
+    1      1   16.67       0.6   +0.54        -        5        5  2024-01-02
+    2      1   16.67       0.6   +0.54        -        5        5  2024-01-02
+    3      1   16.67       0.6   +0.54        -        5        5  2024-01-02
+    4      0    0.00       0.6   -0.82        -        6        6  -
+    5      1   16.67       0.6   +0.54        -        1        4  2024-01-16
+    6      0    0.00       0.6   -0.82        -        6        6  -
+    7      3   50.00       0.6   +3.27      1.0        0        2  2024-01-19
+"""
+
+STARS_OF_SIX_DRAWS = """\
+LUCKY STARS
+   No  Drawn  Freq %  Expected       z  Avg gap  Gap now  Max gap  Last seen
+    1      3   50.00       1.0   +2.19      1.0        1        1  2024-01-16
+    2      4   66.67       1.0   +3.29      0.7        0        2  2024-01-19
+    3      2   33.33       1.0   +1.10      3.0        0        3  2024-01-19
+    4      1   16.67       1.0   +0.00        -        4        4  2024-01-05
+    5      1   16.67       1.0   +0.00        -        3        3  2024-01-09
+    6      0    0.00       1.0   -1.10        -        6        6  -
+    7      0    0.00       1.0   -1.10        -        6        6  -
+    8      0    0.00       1.0   -1.10        -        6        6  -
+    9      0    0.00       1.0   -1.10        -        6        6  -
+   10      0    0.00       1.0   -1.10        -        6        6  -
+   11      0    0.00       1.0   -1.10        -        6        6  -
+   12      1   16.67       1.0   +0.00        -        2        3  2024-01-12
+"""
+
+DISTRIBUTIONS_OF_SIX_DRAWS = """\
+SUM OF THE MAIN NUMBERS: mean 102.8, standard deviation 32.9
+    20-39      1   16.7%  #################
+    40-59      0    0.0%
+    60-79      0    0.0%
+    80-99      1   16.7%  #################
+  100-119      1   16.7%  #################
+  120-139      3   50.0%  ##################################################
+
+RANGE OF THE MAIN NUMBERS (max-min): mean 35.0, standard deviation 8.6
+    15-19      1   16.7%  #################
+    20-24      0    0.0%
+    25-29      1   16.7%  #################
+    30-34      0    0.0%
+    35-39      1   16.7%  #################
+    40-44      3   50.0%  ##################################################
+
+CONSECUTIVE MAIN NUMBERS, per draw
+  Pairs             0 (33.3%)  1 (33.3%)  2 (16.7%)  3 (16.7%)
+  Longest run       1 (33.3%)  2 (33.3%)  3 (16.7%)  4 (16.7%)
+"""
+
+BACKTEST_INTRODUCTION = """\
+Backtest on 3 draws from 2020-01-17 to 2020-01-24. Each strategy plays 2 lines
+per draw, suggested from all the draws before it: the 4 draws from 2020-01-03 to
+2020-01-14 at first, then every draw since. That is 6 lines for EUR 15.00 per
+strategy.
+"""
+
+BACKTEST_TABLES = """\
+Strategy     Winnings          Net      ROI   Wins  Numbers       Stars
+hot       60,000,232.15 60,000,217.15 400001447.7% 100.0%  3.167 (+7.6)  1.000 (+2.7)
+by chance        2.75       -12.25   -81.6%   7.7%  0.500         0.333
++/- 1 SD         7.05         7.05    47.0%  10.9%
+
+Winning lines by prize rank (numbers + stars matched):
+Strategy   2+0  2+1  1+2  3+1  3+2  4+1  5+2
+hot          2    -    -    1    1    1    1
+by chance  0.3  0.1  0.0  0.0  0.0  0.0  0.0
+"""
 
 
 @pytest.fixture
@@ -31,6 +149,23 @@ def data_dir(tmp_path: Path, history: list[Draw]) -> Path:
 def run(*args: str, data_dir: Path | None = None) -> Result:
     prefix = [] if data_dir is None else ["--data-dir", str(data_dir)]
     return CliRunner().invoke(cli, [*prefix, *args])
+
+
+def run_apart(*args: str, data_dir: Path) -> Result:
+    """Like ``run``, with the standard output and error kept apart."""
+    apart: dict[str, Any] = {"mix_stderr": False}
+    try:
+        runner = CliRunner(**apart)  # click before 8.2
+    except TypeError:
+        runner = CliRunner()  # they are always kept apart since
+    return runner.invoke(cli, ["--data-dir", str(data_dir), *args])
+
+
+@pytest.fixture
+def up_to_date(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every cache look up to date, so that no note about its age is printed."""
+    long_ago = schedule.draw_datetime(dt.date(2004, 2, 13))
+    monkeypatch.setattr(schedule, "previous_draw", lambda now=None: long_ago)
 
 
 class TestGeneral:
@@ -51,6 +186,8 @@ class TestGeneral:
             capture_output=True,
             text=True,
             check=False,
+            # The sources under test, whatever copy of the package is installed.
+            env={**os.environ, "PYTHONPATH": str(SOURCES)},
         )
         assert completed.returncode == 0
         assert "Usage: euromillions" in completed.stdout
@@ -73,12 +210,31 @@ class TestGeneral:
         result = run(command, data_dir=tmp_path)
         assert result.exit_code == 1
         assert result.output.startswith("Error:")
+        assert "Delete that file and run `euromillions fetch` again." in result.output
         assert "Traceback" not in result.output
+
+    def test_a_bug_keeps_its_traceback(
+        self, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Only the errors raised on purpose are turned into messages.
+        def broken(*args: object, **options: object) -> None:
+            raise ValueError("a bug")
+
+        monkeypatch.setattr(suggester, "suggest", broken)
+        result = run("suggest", data_dir=data_dir)
+        assert isinstance(result.exception, ValueError)
+        assert "Error:" not in result.output
 
     def test_stale_cache_triggers_a_note(self, data_dir: Path, history: list[Draw]) -> None:
         result = run("suggest", "--lines", "1", data_dir=data_dir)
         assert result.exit_code == 0
         assert f"Note: the history ends on {history[-1].date}" in result.output
+
+    def test_the_note_does_not_pollute_the_standard_output(self, data_dir: Path) -> None:
+        result = run_apart("suggest", "--lines", "1", data_dir=data_dir)
+        assert result.stderr.startswith("Note: the history ends on ")
+        assert "Note:" not in result.stdout
+        assert result.stdout.startswith("Strategy: balanced")
 
     def test_fresh_cache_does_not_trigger_a_note(
         self, data_dir: Path, history: list[Draw], monkeypatch: pytest.MonkeyPatch
@@ -189,6 +345,18 @@ class TestFetch:
         # Deleting the file only helps when its content is the problem.
         assert ("Delete that file" in result.output) is hint
 
+    def test_downloads_into_the_cache(
+        self, tmp_path: Path, paid_history: list[Draw], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The real update, with only the download itself replaced.
+        monkeypatch.setattr(fetcher, "fetch_draws", lambda session=None, now=None: paid_history)
+        result = run("fetch", data_dir=tmp_path / "data")
+        assert result.exit_code == 0
+        assert result.output.startswith("Added 400 new draws.\n")
+        assert fetcher.load_draws(tmp_path / "data" / fetcher.CACHE_FILENAME) == paid_history
+        again = run("fetch", "--force", data_dir=tmp_path / "data")
+        assert again.output.startswith("Nothing new at the source.\n")
+
     def test_a_cache_that_cannot_be_written_is_reported_cleanly(
         self, tmp_path: Path, history: list[Draw], monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -196,7 +364,7 @@ class TestFetch:
             raise OSError("disk full")
 
         monkeypatch.setattr(fetcher, "fetch_draws", lambda session=None, now=None: history)
-        monkeypatch.setattr(fetcher.os, "replace", disk_full)
+        monkeypatch.setattr(os, "replace", disk_full)
         result = run("fetch", data_dir=tmp_path)
         assert result.exit_code == 1
         assert "Error: cannot write the draw cache" in result.output
@@ -391,12 +559,15 @@ class TestBacktest:
             " ".join(result.output.split())
         )
         assert "400 lines for EUR 1,000.00 per strategy" in " ".join(result.output.split())
+        results, wins_by_rank = result.output.split("Winning lines by prize rank")
         rows = {
             line.split()[0]: line.split()
-            for line in result.output.splitlines()
+            for line in results.splitlines()
             if re.match(r"^(hot|cold|balanced|weighted|anti|random) ", line)
         }
         assert list(rows) == ["hot", "cold", "balanced", "weighted", "anti", "random"]
+        names = "hot|cold|balanced|weighted|anti|random|by chance"
+        assert re.findall(rf"^({names}) ", wins_by_rank, re.M) == [*rows, "by chance"]
         for row in rows.values():
             winnings, net, roi = (float(cell.replace(",", "").rstrip("%")) for cell in row[1:4])
             assert net == pytest.approx(winnings - 1000.0, abs=0.011)
@@ -452,7 +623,7 @@ class TestBacktest:
     ) -> None:
         arguments = ("--strategy", "hot", "--lines", "50", "--price", "99999.99", "--seed", "1")
         output = run("backtest", *arguments, data_dir=paid_dir).output
-        (row,) = (line for line in output.splitlines() if line.startswith("hot "))
+        row = next(line for line in output.splitlines() if line.startswith("hot "))
         assert re.fullmatch(r"hot +[\d,.]+ -[\d,.]+ +-100\.0% +\d+\.\d% .*", row)
 
     def test_seed_makes_the_output_reproducible(self, paid_dir: Path) -> None:
@@ -485,7 +656,7 @@ class TestBacktest:
         assert "Backtest on 40 draws" in result.output
         assert "80 lines for EUR 176.00 per strategy" in " ".join(result.output.split())
         names = re.findall(r"^(hot|cold|balanced|weighted|anti|random) ", result.output, re.M)
-        assert names == ["cold", "random"]
+        assert names == ["cold", "random"] * 2  # one row in each of the two tables
 
     def test_static_replays_the_lines_of_the_training_set(self, paid_dir: Path) -> None:
         result = run("backtest", "--static", "--seed", "1", data_dir=paid_dir)
@@ -495,14 +666,24 @@ class TestBacktest:
         refreshed = run("backtest", "--seed", "1", data_dir=paid_dir)
         assert "then every draw since" in " ".join(refreshed.output.split())
 
-    def test_reports_the_biggest_win(self, paid_dir: Path) -> None:
+    def test_reports_the_biggest_win(self, paid_dir: Path, paid_history: list[Draw]) -> None:
         result = run("backtest", "--seed", "1", data_dir=paid_dir)
-        assert re.search(
-            r"^- Biggest win: EUR [\d,]+\.\d\d by \w+ on \d{4}-\d\d-\d\d "
+        found = re.search(
+            r"^- Biggest win: EUR ([\d,]+\.\d\d) by (\w+) on \d{4}-\d\d-\d\d "
             r"\(\d numbers? \+ \d stars?\)\.$",
             result.output,
             re.MULTILINE,
         )
+        assert found
+        # The biggest of all strategies, not of one of them.
+        best_wins = {
+            outcome.strategy: outcome.best_win.amount
+            for outcome in backtest.backtest(paid_history, seed=1).results
+            if outcome.best_win
+        }
+        assert len(set(best_wins.values())) > 1
+        winner = max(best_wins, key=lambda strategy: best_wins[strategy])
+        assert (found[1], found[2]) == (f"{best_wins[winner]:,.2f}", winner)
 
     def test_draws_without_prize_data_are_reported(
         self, tmp_path: Path, paid_history: list[Draw]
@@ -564,8 +745,104 @@ class TestNextDraw:
             result.output,
         )
 
+    def test_announces_the_draw_that_the_schedule_gives(self) -> None:
+        before = schedule.next_draw()
+        output = run("next-draw").output
+        # The draw may take place between the two readings of the clock.
+        expected = {before, schedule.next_draw()}
+        assert any(
+            f"Next draw: {draw:%A} {draw.day} {draw:%B %Y} at 21:05 Paris time" in output
+            for draw in expected
+        )
+
     def test_does_not_need_a_cache(self, tmp_path: Path) -> None:
         assert run("next-draw", data_dir=tmp_path / "missing").exit_code == 0
+
+
+class TestExactOutput:
+    """Every figure printed, checked on histories small enough to verify by hand."""
+
+    @pytest.fixture
+    def six_draws_dir(self, tmp_path: Path, up_to_date: None) -> Path:
+        fetcher.save_draws(SIX_DRAWS, tmp_path / fetcher.CACHE_FILENAME)
+        return tmp_path
+
+    def test_analyze(self, six_draws_dir: Path) -> None:
+        result = run("analyze", "--top", "3", "--window", "4", data_dir=six_draws_dir)
+        assert result.output == f"{ANALYSIS_OF_SIX_DRAWS}\n{DISCLAIMER}\n"
+
+    def test_analyze_full(self, six_draws_dir: Path) -> None:
+        output = run("analyze", "--top", "3", "--window", "4", "--full", data_dir=six_draws_dir)
+        assert output.output.startswith(ANALYSIS_OF_SIX_DRAWS)
+        assert f"\n\n{FIRST_NUMBERS_OF_SIX_DRAWS}" in output.output
+        assert f"\n\n{STARS_OF_SIX_DRAWS}\n{DISTRIBUTIONS_OF_SIX_DRAWS}" in output.output
+        assert output.output.endswith(f"{DISTRIBUTIONS_OF_SIX_DRAWS}\n{DISCLAIMER}\n")
+
+    def test_backtest(
+        self,
+        tmp_path: Path,
+        scenario: list[Draw],
+        up_to_date: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fetcher.save_draws(scenario, tmp_path / fetcher.CACHE_FILENAME)
+        monkeypatch.setattr(suggester, "suggest", SuggestSpy([LINE_A, LINE_B]))
+        arguments = ("--strategy", "hot", "--lines", "2", "--train-fraction", "0.6")
+        output = run("backtest", *arguments, data_dir=tmp_path).output
+        assert output.startswith(f"{BACKTEST_INTRODUCTION}\n{BACKTEST_TABLES}\n- Amounts are")
+        # The jackpot that nobody won that day is valued by estimate, and said to be.
+        assert "\n- 1 win valued by estimate: the rank had no winner that day" in output
+        assert (
+            "\n- Biggest win: EUR 60,000,000.00 by hot on 2020-01-24 (5 numbers + 2 stars).\n"
+            in output
+        )
+
+    def test_suggest(self, six_draws_dir: Path) -> None:
+        result = run(
+            "suggest", "--strategy", "hot", "--lines", "2", "--seed", "1", data_dir=six_draws_dir
+        )
+        lines = result.output.splitlines()
+        assert lines[:3] == [
+            "Strategy: hot - favour numbers drawn more often than expected in recent draws",
+            "Based on 6 draws up to 2024-01-19.",
+            "",
+        ]
+        assert [line[:6] for line in lines[3:5]] == ["   1. ", "   2. "]
+        assert result.output.endswith(f"\n\n{DISCLAIMER}\n")
+
+
+class TestWindowOption:
+    def test_suggest_passes_it_on(self, data_dir: Path) -> None:
+        def lines(window: str) -> list[str]:
+            arguments = ("--strategy", "hot", "--window", window, "--seed", "1")
+            return LINE_PATTERN.findall(run("suggest", *arguments, data_dir=data_dir).output)
+
+        assert run(
+            "suggest", "--strategy", "hot", "--window", "5", "--seed", "1", data_dir=data_dir
+        ).output != (
+            run(
+                "suggest", "--strategy", "hot", "--window", "300", "--seed", "1", data_dir=data_dir
+            ).output
+        )
+        assert len(lines("5")) == 5
+
+    def test_backtest_passes_it_on(
+        self, tmp_path: Path, paid_history: list[Draw], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fetcher.save_draws(paid_history[:50], tmp_path / fetcher.CACHE_FILENAME)
+        windows: list[int] = []
+
+        def spy(draws: object, strategy: str, *, lines: int, window: int, seed: int) -> object:
+            windows.append(window)
+            return [LINE_A, LINE_B][:lines]
+
+        monkeypatch.setattr(suggester, "suggest", spy)
+        arguments = ("--strategy", "hot", "--lines", "2", "--window", "7")
+        assert run("backtest", *arguments, data_dir=tmp_path).exit_code == 0
+        assert windows == [7] * 10
+
+    def test_analyze_passes_it_on(self, data_dir: Path) -> None:
+        assert "Hot, last 7 " in run("analyze", "--window", "7", data_dir=data_dir).output
 
 
 class TestFormatting:
