@@ -11,6 +11,7 @@ import math
 import re
 import sys
 import threading
+import traceback
 from collections.abc import Callable, Mapping
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -99,6 +100,7 @@ class BacktestJob:
         with self._lock:
             if self._state["state"] == "running":
                 raise JobRunning("a backtest is already running")
+            previous = self._state
             self._state = self._fresh("running", settings)
             self._cancel.clear()
         started = threading.Event()
@@ -127,7 +129,7 @@ class BacktestJob:
             with self._lock:
                 self._state.update(outcome)
                 if failure:  # rejected before it started: as if it never ran
-                    self._state = self._fresh("idle", {})
+                    self._state = previous
             started.set()
 
         self._thread = threading.Thread(target=run, name="backtest", daemon=True)
@@ -216,9 +218,13 @@ def _body_value(body: Mapping[str, Any], name: str, kind: type, default: Any) ->
     if isinstance(value, bool) != (kind is bool):
         raise ValueError(f"{name} must be a {kind.__name__}, got {value!r}")
     if kind is float and isinstance(value, (int, float)):
-        if not math.isfinite(value):
-            raise ValueError(f"{name} must be a finite number, got {value!r}")
-        return float(value)
+        try:
+            number = float(value)
+        except OverflowError:
+            number = math.inf
+        if not math.isfinite(number):
+            raise ValueError(f"{name} must be a finite number")
+        return number
     if not isinstance(value, kind):
         raise ValueError(f"{name} must be a {kind.__name__}, got {value!r}")
     return value
@@ -312,11 +318,21 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
         except ValueError as exc:  # HistoryError included: the settings do not fit the history
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except Exception as exc:  # a bug: say so, rather than drop the connection
+            traceback.print_exc()
+            message = f"unexpected error: {exc!r}"
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": message})
 
     def _check_host(self) -> None:
+        """Refuse requests that name another host (DNS rebinding) or come from another site."""
         port = self.server.server_address[1]
-        if self.headers.get("Host") not in {f"127.0.0.1:{port}", f"localhost:{port}"}:
+        hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        if self.headers.get("Host") not in hosts:
             raise HttpError(HTTPStatus.FORBIDDEN, "this server only answers to 127.0.0.1")
+        origin = self.headers.get("Origin")
+        cross_site = self.headers.get("Sec-Fetch-Site") == "cross-site"
+        if cross_site or (origin is not None and origin not in {f"http://{h}" for h in hosts}):
+            raise HttpError(HTTPStatus.FORBIDDEN, "requests from other sites are refused")
 
     def _routes(self) -> dict[str, dict[str, _Route]]:
         return {
@@ -410,6 +426,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "DENY")
         self.end_headers()
         self.wfile.write(body)
 

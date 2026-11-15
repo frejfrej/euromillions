@@ -20,6 +20,7 @@ from euromillions import fetcher
 from euromillions.backtest import Backtest
 from euromillions.fetcher import FetchError, UpdateResult
 from euromillions.models import Draw
+from euromillions.web import api as api_module
 from euromillions.web.server import STATIC, make_server
 
 from .conftest import TYPICAL_PRIZES, random_history
@@ -33,11 +34,20 @@ class Client:
     cache: Path
 
     def request(
-        self, method: str, path: str, body: Any = None, *, host: str | None = None
+        self,
+        method: str,
+        path: str,
+        body: Any = None,
+        *,
+        host: str | None = None,
+        headers: dict[str, str] | None = None,
+        body_text: str | None = None,
     ) -> tuple[int, dict[str, str], bytes]:
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
-        headers = {"Host": host or f"127.0.0.1:{self.port}"}
+        headers = {"Host": host or f"127.0.0.1:{self.port}", **(headers or {})}
         data = None if body is None else json.dumps(body).encode()
+        if body_text is not None:
+            data = body_text.encode()
         if data is not None:
             headers["Content-Type"] = "application/json"
         try:
@@ -285,3 +295,54 @@ class TestBacktest:
         assert client.json("GET", "/api/backtest")[1]["state"] == "running"
         gate.release.set()
         assert client.wait_for("done")["result"]["trainDraws"] == 240  # the 300 draws it started on
+
+
+class TestReviewFixes:
+    def test_a_rejected_backtest_keeps_the_last_result(
+        self, client: Client, history: list[Draw]
+    ) -> None:
+        settings = {"trainFraction": 0.9, "lines": 1, "seed": 1, "strategies": ["hot"]}
+        assert client.json("POST", "/api/backtest", settings)[0] == 202
+        done = client.wait_for("done")
+        assert client.json("POST", "/api/backtest", {"price": 0})[0] == 400
+        assert client.json("GET", "/api/backtest")[1] == done
+
+    def test_an_unexpected_error_is_a_json_500(
+        self, client: Client, history: list[Draw], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def broken(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("a bug")
+
+        monkeypatch.setattr(api_module, "analysis", broken)
+        status, body = client.json("GET", "/api/analysis")
+        assert status == 500
+        assert "a bug" in body["error"]
+
+    def test_a_huge_number_is_a_bad_request(self, client: Client, history: list[Draw]) -> None:
+        status, _, data = client.request(
+            "POST",
+            "/api/backtest",
+            None,
+            body_text='{"trainFraction": 1' + "0" * 400 + "}",
+        )
+        assert status == 400
+        assert json.loads(data)["error"]
+
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            {"Origin": "https://evil.example"},
+            {"Sec-Fetch-Site": "cross-site"},
+        ],
+    )
+    def test_cross_site_requests_are_refused(
+        self, client: Client, history: list[Draw], headers: dict[str, str]
+    ) -> None:
+        status, _, _ = client.request("POST", "/api/backtest", {}, headers=headers)
+        assert status == 403
+        assert client.json("GET", "/api/backtest")[1]["state"] == "idle"
+
+    def test_same_site_requests_are_accepted(self, client: Client, history: list[Draw]) -> None:
+        headers = {"Origin": f"http://localhost:{client.port}", "Sec-Fetch-Site": "same-origin"}
+        status, _, _ = client.request("GET", "/api/status", headers=headers)
+        assert status == 200
