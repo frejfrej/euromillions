@@ -1,3 +1,4 @@
 include PLAN.md
 graft tests
 global-exclude __pycache__ *.py[cod]
+recursive-include src/euromillions/web/static *

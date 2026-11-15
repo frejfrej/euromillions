@@ -37,7 +37,7 @@ version = { attr = "euromillions.__version__" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-euromillions = ["py.typed"]
+euromillions = ["py.typed", "web/static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,10 +1,13 @@
-"""Command-line interface: ``euromillions fetch | analyze | suggest | backtest | next-draw``."""
+"""Command-line interface: ``euromillions fetch | analyze | suggest | backtest | next-draw``,
+and ``serve`` for the web pages."""
 
 from __future__ import annotations
 
 import datetime as dt
+import errno
 import math
 import textwrap
+import webbrowser
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -32,6 +35,7 @@ from euromillions.models import (
     BallKind,
     Draw,
 )
+from euromillions.web import server as web_server
 
 _WIDTH = 80
 _LABEL_WIDTH = 18
@@ -264,6 +268,46 @@ def next_draw() -> None:
         f"Next draw: {upcoming:%A} {upcoming.day} {upcoming:%B %Y} at {upcoming:%H:%M} "
         f"Paris time ({_format_countdown(upcoming, now)})."
     )
+
+
+@cli.command()
+@click.option(
+    "--port",
+    type=click.IntRange(0, 65535),
+    default=8000,
+    show_default=True,
+    help="Port to listen on (0: any free port).",
+)
+@click.option("--no-browser", is_flag=True, help="Do not open the pages in the browser.")
+@click.pass_obj
+def serve(cache_path: Path, port: int, no_browser: bool) -> None:
+    """Show the analysis, suggestions and backtests in the browser.
+
+    The pages are only served to this computer (127.0.0.1). Press Ctrl+C to stop.
+    """
+    has_history = bool(fetcher.load_draws(cache_path))  # a corrupt cache is reported now
+    try:
+        httpd = web_server.make_server(cache_path, port)
+    except OSError as exc:
+        if exc.errno in {errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", None)}:
+            raise click.ClickException(
+                f"port {port} is already in use: choose another one with --port"
+            ) from exc
+        raise
+    url = f"http://127.0.0.1:{httpd.server_address[1]}/"
+    click.echo(f"Serving on {url} - press Ctrl+C to stop.")
+    if not has_history:
+        click.echo(
+            f"No draw history yet in {cache_path.resolve()}: the pages offer to download it."
+        )
+    if not no_browser:
+        webbrowser.open(url)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        click.echo("Stopped.")
+    finally:
+        httpd.server_close()
 
 
 def _load_draws(cache_path: Path) -> list[Draw]:
