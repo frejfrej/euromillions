@@ -22,6 +22,7 @@ from euromillions.models import (
     MAIN_COUNT,
     MAIN_MAX,
     PRIZE_RANKS,
+    STAR_POOL_HISTORY,
     BallKind,
     Draw,
     chronological,
@@ -133,6 +134,16 @@ def _bands(distribution: Distribution, width: int) -> list[JSON]:
     ]
 
 
+def _star_pool_since() -> dict[int, str]:
+    """Return the date each star beyond the first pool joined it."""
+    since: dict[int, str] = {}
+    previous = STAR_POOL_HISTORY[0][1]
+    for day, pool in STAR_POOL_HISTORY[1:]:
+        since.update(dict.fromkeys(range(previous + 1, pool + 1), day.isoformat()))
+        previous = pool
+    return since
+
+
 def analysis(
     draws: Sequence[Draw], *, window: int = analyzer.DEFAULT_WINDOW, top: int = 10
 ) -> JSON:
@@ -182,6 +193,7 @@ def analysis(
         "oddCounts": report.odd_counts,
         "lowCounts": report.low_counts,
         "lowMax": analyzer.LOW_MAX,
+        "starPoolSince": _star_pool_since(),
         "fairSplit": analyzer.fair_split_shares(),
         "chance": {
             "extremeZ": {

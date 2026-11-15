@@ -171,3 +171,11 @@ class TestFetchResult:
         history = random_history(50, prizes=TYPICAL_PRIZES)
         result = api.fetch_result(UpdateResult(history, 0, 0, False), now=after_draw(history[-1]))
         assert result["unpublished"] is None
+
+
+def test_analysis_says_when_the_late_stars_joined_the_pool() -> None:
+    assert api.analysis(SIX_DRAWS)["starPoolSince"] == {
+        10: "2011-05-10",
+        11: "2011-05-10",
+        12: "2016-09-27",
+    }
