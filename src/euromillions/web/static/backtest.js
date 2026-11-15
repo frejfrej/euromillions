@@ -3,7 +3,6 @@
 
 (() => {
   const { el, tr } = EM;
-  const WINDOWS = [50, 100, 200];
   const POLL_MS = 500;
   let status = null;
   let container = null;
@@ -19,7 +18,7 @@
     if (!settings) {
       settings = {
         strategies: [...status.strategies.map((s) => s.name), "random"],
-        trainFraction: 0.8,
+        trainDraws: Math.floor(status.draws * 0.8 + 1e-9), // as the command line's 0.8
         lines: 5,
         window: 50,
         seed: "",
@@ -37,20 +36,46 @@
 
   // --- Running ---
 
-  async function run() {
-    formError = "";
+  // The settings the server would refuse, said in the language of the page.
+  function invalid() {
+    const train = Number(settings.trainDraws);
+    const lines = Number(settings.lines);
+    const price = Number(settings.price);
     const seed = String(settings.seed).trim();
+    const since = EM.date(status.currentRulesSince);
+    if (!settings.strategies.length) return tr("Pick at least one strategy.", "Choisissez au moins une stratégie.");
+    if (!trainValid()) {
+      return tr(`The training draws must be a whole number from 1 to ${EM.num(status.draws - 1)}.`,
+        `Le nombre de tirages d’entraînement doit être un entier de 1 à ${EM.num(status.draws - 1)}.`);
+    }
+    if (status.minTrainDraws !== null && train < status.minTrainDraws) {
+      return tr(`${EM.count(status.minTrainDraws, "training draw", "tirage")} at least: only draws since ${since} can be played.`,
+        `${EM.count(status.minTrainDraws, "draw", "tirage")} d’entraînement au moins${EM.NNBSP}: seuls les tirages depuis le ${since} peuvent être joués.`);
+    }
+    if (String(settings.lines).trim() === "" || !Number.isInteger(lines) || lines < 1) {
+      return tr("Lines per draw played must be a whole number, 1 or more.",
+        "Le nombre de grilles par tirage joué doit être un entier, 1 ou plus.");
+    }
+    if (!(price > 0 && Number.isFinite(price))) return tr("The line price must be above zero.", "Le prix d’une grille doit être supérieur à zéro.");
     if (seed && !/^-?\d+$/.test(seed)) {
-      formError = tr("The seed must be a whole number, or left empty.", "La graine doit être un nombre entier, ou rester vide.");
+      return tr("The seed must be a whole number, or left empty.", "La graine doit être un nombre entier, ou rester vide.");
+    }
+    return "";
+  }
+
+  async function run() {
+    formError = invalid();
+    if (formError) {
       render();
       return;
     }
+    const seed = String(settings.seed).trim();
     const body = {
       strategies: settings.strategies,
-      trainFraction: Number(settings.trainFraction),
+      trainFraction: Number(settings.trainDraws) / status.draws, // the server splits there exactly
       lines: Number(settings.lines),
       window: Number(settings.window),
-      seed: seed ? Number(seed) : null,
+      seed: seed ? BigInt(seed).toString() : null, // as text: a JSON number loses the digits beyond 2^53
       refresh: settings.refresh,
       price: Number(settings.price),
     };
@@ -92,6 +117,8 @@
   // --- Layout ---
 
   function render() {
+    const active = document.activeElement;
+    const focused = active && active.dataset ? active.dataset.focus : null;
     container.replaceChildren(
       el("div", { class: "intro" },
         el("h1", {}, tr("Backtest the strategies", "Tester les stratégies sur le passé")),
@@ -102,6 +129,10 @@
       form(),
       el("div", { id: "job", style: "display: contents" }));
     renderJob();
+    if (focused) { // give the focus back to the control that redrew the page
+      const again = container.querySelector(`[data-focus="${focused}"]`);
+      if (again) again.focus();
+    }
   }
 
   function renderJob() {
@@ -121,11 +152,15 @@
 
   // --- Settings ---
 
+  function trainValid() {
+    const train = Number(settings.trainDraws);
+    return String(settings.trainDraws).trim() !== "" && Number.isInteger(train) && train >= 1 && train < status.draws;
+  }
+
   function trainHint() {
     const total = status.draws;
-    const fraction = Number(settings.trainFraction);
-    if (!(fraction > 0 && fraction < 1)) return tr("Between 0 and 1.", "Entre 0 et 1.");
-    const train = Math.floor(total * fraction + 1e-9);
+    const train = Number(settings.trainDraws);
+    if (!trainValid()) return tr(`From 1 to ${EM.num(total - 1)}.`, `De 1 à ${EM.num(total - 1)}.`);
     return tr(`The first ${EM.num(train)} draws build the statistics; the next ${EM.num(total - train)} are played.`,
       `Les ${EM.num(train)} premiers tirages servent aux statistiques${EM.NNBSP}; les ${EM.num(total - train)} suivants sont joués.`);
   }
@@ -135,7 +170,7 @@
     const chip = (name) => {
       const on = settings.strategies.includes(name);
       return el("button", {
-        type: "button", class: "chip-toggle", "aria-pressed": String(on),
+        type: "button", class: "chip-toggle", "aria-pressed": String(on), "data-focus": `strategy-${name}`,
         onclick: () => {
           settings.strategies = on ? settings.strategies.filter((s) => s !== name) : all.filter((s) => s === name || settings.strategies.includes(s));
           render();
@@ -143,17 +178,17 @@
       }, on ? EM.icon("check") : null, label(name));
     };
     const segment = (refresh, text) => el("button", {
-      type: "button", "aria-pressed": String(settings.refresh === refresh),
+      type: "button", "aria-pressed": String(settings.refresh === refresh), "data-focus": `refresh-${refresh}`,
       onclick: () => { settings.refresh = refresh; render(); },
     }, text);
     const input = (id, key, attrs) => el("input", {
       id, value: settings[key], ...attrs,
       oninput: (event) => {
         settings[key] = event.target.value;
-        if (key === "trainFraction") document.getElementById("trainHint").textContent = trainHint();
+        if (key === "trainDraws") document.getElementById("trainHint").textContent = trainHint();
       },
     });
-    const min = status.minTrainFraction;
+    const min = status.minTrainDraws;
     const since = status.currentRulesSince;
     return el("section", { class: "card", "aria-label": tr("Settings", "Réglages") },
       el("div", { class: "row", style: "align-items: flex-end; gap: 18px 32px" },
@@ -167,23 +202,22 @@
             segment(false, tr("Frozen after training", "Figées après l’entraînement"))))),
       el("div", { class: "row", style: "align-items: flex-end; gap: 18px 24px" },
         el("div", { class: "field", style: "flex: 2 1 280px" },
-          el("label", { for: "train" }, tr("Training part", "Part d’entraînement")),
-          el("div", { style: "display: flex; gap: 8px" },
-            input("train", "trainFraction", { type: "number", min: min === null ? 0.01 : min, max: 0.99, step: 0.001, style: "flex: 1; min-width: 0", "aria-describedby": "trainHint" }),
+          el("label", { for: "train" }, tr("Training draws", "Nb de tirages d’entraînement")),
+          el("div", { style: "display: flex; flex-wrap: wrap; gap: 8px" },
+            input("train", "trainDraws", { type: "number", min: min === null ? 1 : min, max: status.draws - 1, step: 1, style: "flex: 1 1 96px; min-width: 96px", "aria-describedby": "trainHint" }),
             min === null ? null : el("button", {
-              type: "button", class: "button",
-              onclick: () => { settings.trainFraction = min; render(); },
+              type: "button", class: "button", "data-focus": "train-min",
+              onclick: () => { settings.trainDraws = min; render(); },
             }, tr(`Every draw since ${EM.monthYear(since)}`, `Tous les tirages depuis ${EM.monthYear(since)}`))),
           el("span", { class: "hint", id: "trainHint" }, trainHint()),
           min === null ? null : el("span", { class: "hint" }, tr(
-            `${min} at least: only draws since ${EM.date(since)} can be played.`,
-            `${EM.fixed(min, 3)} au moins${EM.NNBSP}: seuls les tirages depuis le ${EM.date(since)} peuvent être joués.`))),
+            `${EM.count(min, "draw", "tirage")} at least: only draws since ${EM.date(since)} can be played.`,
+            `${EM.count(min, "draw", "tirage")} au moins${EM.NNBSP}: seuls les tirages depuis le ${EM.date(since)} peuvent être joués.`))),
         el("div", { class: "field", style: "flex: 0 1 120px" },
-          el("label", { for: "lpd" }, tr("Lines a draw", "Grilles par tirage")), input("lpd", "lines", { type: "number", min: 1, max: 50 })),
-        el("div", { class: "field", style: "flex: 0 1 150px" },
-          el("label", { for: "bwindow" }, tr("Recent window", "Période récente")),
-          el("select", { id: "bwindow", onchange: (event) => { settings.window = Number(event.target.value); } },
-            WINDOWS.map((w) => el("option", { value: w, selected: w === Number(settings.window) }, tr(`Last ${w} draws`, `${w} derniers tirages`))))),
+          el("label", { for: "lpd" }, tr("Lines per draw played", "Grilles par tirage joué")), input("lpd", "lines", { type: "number", min: 1, step: 1 })),
+        el("div", { class: "field", style: "flex: 0 1 auto" },
+          el("span", { class: "label", id: "bwindowLabel" }, tr("Recent window", "Période récente")),
+          EM.windowChoice(settings.window, (w) => { settings.window = w; render(); }, "bwindowLabel")),
         el("div", { class: "field", style: "flex: 0 1 120px" },
           el("label", { for: "bseed" }, tr("Seed", "Graine")),
           input("bseed", "seed", { type: "text", inputmode: "numeric", placeholder: tr("random", "au hasard") })),
@@ -219,7 +253,7 @@
       return [tr(`Every strategy did what chance does: winnings within two standard deviations of random lines, and no match count beyond ±${threshold}.`,
         `Chaque stratégie a fait ce que fait le hasard${EM.NNBSP}: des gains à moins de deux écarts-types de ceux de grilles au hasard, et aucun score de numéros trouvés au-delà de ±${threshold}.`)];
     }
-    const band = `${EM.euro(result.chance.winnings)} ± ${EM.euro(2 * result.chance.sd)}`;
+    const band = `${EM.euro(result.chance.winnings)} ±\u00a0${EM.euro(2 * result.chance.sd)}`;
     const lines = [
       ...outside.map((r) => tr(
         `${EM.capitalize(label(r.strategy))} won ${EM.euro(r.commonWinnings)} in the common prize ranks, outside the ${band} (two standard deviations) that random lines win by chance.`,
@@ -243,9 +277,9 @@
     const seed = seeded ? tr(` · seed ${settingsRun.seed}`, ` · graine ${settingsRun.seed}`) : "";
     return tr(
       `${draws(result.testDraws)} played, from ${EM.date(result.testStart)} to ${EM.date(result.testEnd)} · ` +
-      `${EM.count(result.linesPerDraw, "line")} a draw · ${EM.euro(result.cost)} staked per strategy · ${how}${seed}`,
+      `${EM.count(result.linesPerDraw, "line")} per draw played · ${EM.euro(result.cost)} staked per strategy · ${how}${seed}`,
       `${draws(result.testDraws)} ${result.testDraws > 1 ? "joués" : "joué"}, du ${EM.date(result.testStart)} au ${EM.date(result.testEnd)} · ` +
-      `${EM.count(result.linesPerDraw, "line", "grille")} par tirage · ${EM.euro(result.cost)} misés par stratégie · ${how}${seed}`);
+      `${EM.count(result.linesPerDraw, "line", "grille")} par tirage joué · ${EM.euro(result.cost)} misés par stratégie · ${how}${seed}`);
   }
 
   function tiles(result) {
@@ -260,7 +294,7 @@
       tile(tr("Within chance", "Dans le hasard"), tr(`${within} of ${result.results.length}`, `${within} sur ${result.results.length}`),
         tr("winnings within two standard deviations", "gains à moins de deux écarts-types")),
       tile(tr("Random lines, by chance", "Grilles au hasard, en moyenne"),
-        `${EM.signedPct(result.chance.roi)} ± ${EM.points(result.chance.roiSd)}`,
+        `${EM.signedPct(result.chance.roi)} ±\u00a0${EM.points(result.chance.roiSd)}`,
         tr(`prize ranks ${ranks[0]} to ${ranks[ranks.length - 1]}`, `rangs ${ranks[0]} à ${ranks[ranks.length - 1]}`)));
   }
 
@@ -417,7 +451,7 @@
     }
     if (reading.estimatedWins) {
       items.push(tr(`${EM.count(reading.estimatedWins, "win")} valued by estimate: the rank had no winner that day, or their number is unknown.`,
-        `${EM.count(reading.estimatedWins, "gain")} ${reading.estimatedWins > 1 ? "estimés" : "estimé"}${EM.NNBSP}: le rang n’avait pas de gagnant ce jour-là, ou leur nombre est inconnu.`));
+        `${EM.count(reading.estimatedWins, "win", "gain")} ${reading.estimatedWins > 1 ? "estimés" : "estimé"}${EM.NNBSP}: le rang n’avait pas de gagnant ce jour-là, ou leur nombre est inconnu.`));
     }
     if (reading.skippedDraws) {
       items.push(tr(`${draws(reading.skippedDraws)} without prize data could not be played.`,

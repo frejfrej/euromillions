@@ -17,6 +17,7 @@ from euromillions.errors import HistoryError
 from euromillions.models import (
     MAIN_COUNT,
     MAIN_MAX,
+    POSSIBLE_LINES,
     STAR_COUNT,
     STAR_MAX,
     BallKind,
@@ -301,6 +302,8 @@ def suggest(
         raise ValueError(f"unknown strategy {strategy!r}; choose from {', '.join(STRATEGIES)}")
     if lines < 1:
         raise ValueError(f"lines must be at least 1, got {lines}")
+    if lines > POSSIBLE_LINES:  # the lines are all different
+        raise ValueError(f"there are only {POSSIBLE_LINES:,} different lines, got {lines:,}")
     if window < 1:
         raise ValueError(f"window must be at least 1, got {window}")
     history = list(draws)

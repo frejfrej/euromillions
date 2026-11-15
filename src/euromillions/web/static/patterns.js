@@ -153,11 +153,11 @@
         el("span", { class: "value" }, times(entry.count))))),
       ranking.more ? el("p", { class: "small muted" }, tr(
         `+${ranking.more} more at ${times(ranking.entries[ranking.entries.length - 1].count)}`,
-        `+${ranking.more} autres à ${times(ranking.entries[ranking.entries.length - 1].count)}`)) : null,
+        `+${ranking.more} ${ranking.more > 1 ? "autres" : "autre"} à ${times(ranking.entries[ranking.entries.length - 1].count)}`)) : null,
       el("p", { class: "small muted" }, note));
-    const chance = (ranking, en, fr) => tr(
+    const chance = (ranking, en, fr, luckiest = "La plus chanceuse") => tr(
       `A given ${en}: ${EM.fixed(ranking.expected)} times expected. The luckiest: about ${ranking.typicalTop} by chance alone.`,
-      `${fr}${EM.NNBSP}: ${EM.fixed(ranking.expected)} fois attendu. La plus chanceuse${EM.NNBSP}: environ ${ranking.typicalTop} par le seul hasard.`);
+      `${fr}${EM.NNBSP}: ${EM.fixed(ranking.expected)} fois attendu. ${luckiest}${EM.NNBSP}: environ ${ranking.typicalTop} par le seul hasard.`);
     return el("section", { class: "card", "aria-labelledby": "togTitle" },
       el("div", { style: "display: flex; flex-direction: column; gap: 4px" },
         el("h2", { id: "togTitle" }, tr("Drawn together most often", "Sortis ensemble le plus souvent")),
@@ -166,7 +166,7 @@
           `La combinaison la plus chanceuse paraît toujours remarquable${EM.NNBSP}: sous chaque liste, ce qu’atteint la plus chanceuse par le seul hasard.`))),
       el("div", { class: "cards", style: "gap: 24px" },
         list(tr("Pairs of numbers", "Paires de numéros"), analysis.pairs, chance(analysis.pairs, "pair", "Une paire donnée")),
-        list(tr("Triplets", "Triplets"), analysis.triplets, chance(analysis.triplets, "triplet", "Un triplet donné")),
+        list(tr("Triplets", "Triplets"), analysis.triplets, chance(analysis.triplets, "triplet", "Un triplet donné", "Le plus chanceux")),
         list(tr("Pairs of Lucky Stars", "Paires d’étoiles"), analysis.starPairs,
           chance(analysis.starPairs, "star pair", "Une paire d’étoiles donnée") +
           tr(" Counted on the draws with 12 stars only.", " Comptées sur les tirages à 12 étoiles seulement."))));

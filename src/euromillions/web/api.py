@@ -32,9 +32,6 @@ from euromillions.models import (
 
 JSON = dict[str, Any]
 
-#: Most lines the pages may ask for at once.
-MAX_LINES = 10
-
 #: Seeds the server picks when a page asks for lines without one.
 _SEED_RANGE = (1, 1_000_000)
 
@@ -43,6 +40,11 @@ _RANK_MATCHES = {rank: matches for matches, rank in PRIZE_RANKS.items()}
 
 def _date(day: dt.date | None) -> str | None:
     return None if day is None else day.isoformat()
+
+
+def _average_return(draws: Sequence[Draw]) -> JSON | None:
+    average = backtest.average_return(draws)
+    return None if average is None else {"amount": average.amount, "draws": average.draws}
 
 
 def status(draws: Sequence[Draw], *, now: dt.datetime | None = None) -> JSON:
@@ -74,6 +76,8 @@ def status(draws: Sequence[Draw], *, now: dt.datetime | None = None) -> JSON:
             for name, description in suggester.STRATEGIES.items()
         ],
         "minTrainFraction": backtest.min_train_fraction(history),
+        "minTrainDraws": backtest.min_train_draws(history),
+        "averageReturn": _average_return(history),
         "linePrice": LINE_PRICE,
         "currentRulesSince": CURRENT_RULES_SINCE.isoformat(),
         "disclaimer": DISCLAIMER,
@@ -224,8 +228,6 @@ def suggestion(
     for an invalid argument and :class:`~euromillions.errors.HistoryError` for an empty or
     too short history.
     """
-    if not 1 <= lines <= MAX_LINES:
-        raise ValueError(f"lines must be between 1 and {MAX_LINES}, got {lines}")
     if seed is None:
         seed = (rng or random.Random()).randrange(*_SEED_RANGE)
     history = chronological(draws)

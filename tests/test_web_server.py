@@ -166,7 +166,7 @@ class TestData:
         "query",
         [
             "lines=abc",
-            "lines=11",
+            "lines=139838161",
             "window=0",
             "seed=1.5",
             "strategy=nope",
@@ -263,7 +263,7 @@ class TestBacktest:
             {"strategies": ["nope"]},
             {"strategies": "hot"},
             {"lines": 0},
-            {"lines": 51},
+            {"lines": 139_838_161},
             {"lines": True},
             {"trainFraction": "half"},
             {"refresh": "yes"},
@@ -317,6 +317,21 @@ class TestReviewFixes:
         status, body = client.json("GET", "/api/analysis")
         assert status == 500
         assert "a bug" in body["error"]
+
+    @pytest.mark.parametrize("seed", [12345678901234567891, "12345678901234567891"])
+    def test_a_backtest_seed_keeps_every_digit(
+        self, client: Client, history: list[Draw], seed: int | str
+    ) -> None:
+        settings = {"trainFraction": 0.9, "lines": 1, "seed": seed, "strategies": ["hot"]}
+        assert client.json("POST", "/api/backtest", settings)[0] == 202
+        assert client.wait_for("done")["settings"]["seed"] == "12345678901234567891"
+
+    @pytest.mark.parametrize("seed", ["1.5", "seven", "", 1.5, True])
+    def test_a_backtest_seed_must_be_a_whole_number(
+        self, client: Client, history: list[Draw], seed: object
+    ) -> None:
+        status, body = client.json("POST", "/api/backtest", {"strategies": ["hot"], "seed": seed})
+        assert (status, body["error"].startswith("seed must be a whole number")) == (400, True)
 
     def test_a_huge_number_is_a_bad_request(self, client: Client, history: list[Draw]) -> None:
         status, _, data = client.request(

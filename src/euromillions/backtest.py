@@ -20,6 +20,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from statistics import NormalDist, fmean
+from typing import NamedTuple
 
 from euromillions import suggester
 from euromillions.analyzer import DEFAULT_WINDOW
@@ -29,6 +30,7 @@ from euromillions.models import (
     LINE_PRICE,
     MAIN_COUNT,
     MAIN_MAX,
+    POSSIBLE_LINES,
     PRIZE_RANKS,
     STAR_COUNT,
     STAR_MAX,
@@ -46,15 +48,13 @@ RANDOM = suggester.BASELINE
 #: What a backtest compares by default: every suggestion strategy, then the baseline.
 DEFAULT_STRATEGIES: tuple[str, ...] = (*suggester.STRATEGIES, RANDOM)
 
-_LINES = math.comb(MAIN_MAX, MAIN_COUNT) * math.comb(STAR_MAX, STAR_COUNT)
-
 #: Probability that a random line wins each prize rank under the current rules.
 RANK_PROBABILITIES: dict[int, float] = {
     rank: math.comb(MAIN_COUNT, main)
     * math.comb(MAIN_MAX - MAIN_COUNT, MAIN_COUNT - main)
     * math.comb(STAR_COUNT, stars)
     * math.comb(STAR_MAX - STAR_COUNT, STAR_COUNT - stars)
-    / _LINES
+    / POSSIBLE_LINES
     for (main, stars), rank in PRIZE_RANKS.items()
 }
 
@@ -340,19 +340,63 @@ def backtest(
     )
 
 
-def min_train_fraction(draws: Iterable[Draw]) -> float | None:
-    """Return the smallest ``train_fraction`` that :func:`backtest` accepts for ``draws``.
+class AverageReturn(NamedTuple):
+    """What a line returned on average in prizes (``amount``, in euros) over ``draws`` draws."""
+
+    amount: float
+    draws: int
+
+
+#: The last prize rank (2 numbers), won by about one line in 22: its winners count the lines.
+_LAST_RANK = max(PRIZE_RANKS.values())
+
+
+def average_return(draws: Iterable[Draw]) -> AverageReturn | None:
+    """Return what a line returned on average in prizes, every rank and jackpot included.
+
+    The prizes paid in each draw under the current rules are added up and divided by the
+    lines sold, which are the winners of the last rank divided by its probability: an
+    estimate within a fraction of a percent, at about a million such winners a draw.
+    That is the return of a line played like the others, rollovers included. Averaging the
+    probability of each rank times its published prize instead would count every jackpot
+    nobody won as worth 0. ``None`` without a draw whose winners and prizes are all known.
+    """
+    paid = sold = 0.0
+    counted = 0
+    for draw in draws:
+        if draw.date < CURRENT_RULES_SINCE or not _is_scorable(draw):
+            continue
+        if not all(tier.winners for tier in draw.prizes[TOP_RANKS:]):
+            continue  # the number of winners is missing from the source
+        paid += sum(tier.winners * tier.prize for tier in draw.prizes)
+        sold += draw.prizes[_LAST_RANK - 1].winners / RANK_PROBABILITIES[_LAST_RANK]
+        counted += 1
+    return AverageReturn(paid / sold, counted) if counted else None
+
+
+def min_train_draws(draws: Iterable[Draw]) -> int | None:
+    """Return the smallest training set, in draws, that :func:`backtest` accepts for ``draws``.
 
     The evaluation has to start under the current rules, and the training set needs one
-    draw at least. The fraction is rounded up as in the error :func:`backtest` raises for a
-    smaller one. ``None`` when no split can be evaluated: no draw under the current rules,
-    or fewer than two draws.
+    draw at least. ``None`` when no split can be evaluated: no draw under the current
+    rules, or fewer than two draws.
     """
     history = chronological(draws)
     older = sum(draw.date < CURRENT_RULES_SINCE for draw in history)
     if len(history) < 2 or older >= len(history):
         return None
-    return float(_round_up(max(older, 1) / len(history)))
+    return max(older, 1)
+
+
+def min_train_fraction(draws: Iterable[Draw]) -> float | None:
+    """Return the smallest ``train_fraction`` that :func:`backtest` accepts for ``draws``.
+
+    That is :func:`min_train_draws` as a share of the history, rounded up as in the error
+    :func:`backtest` raises for a smaller one; ``None`` when no split can be evaluated.
+    """
+    history = chronological(draws)
+    smallest = min_train_draws(history)
+    return None if smallest is None else float(_round_up(smallest / len(history)))
 
 
 def _round_up(fraction: float) -> str:
