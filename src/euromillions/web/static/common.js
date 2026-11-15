@@ -1,17 +1,62 @@
 // EuroMillions Analyzer: what every page shares. Every figure comes from the server;
-// this file only fetches, formats and lays out.
+// this file only fetches, formats, translates and lays out.
 "use strict";
 
 const EM = (() => {
-  const STOPPED = "The server has stopped: run `euromillions serve` again.";
-  const PAGES = [
-    ["index.html", "Numbers"],
-    ["patterns.html", "Patterns"],
-    ["suggest.html", "Suggest"],
-    ["backtest.html", "Backtest"],
-  ];
-  const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   const MINUS = "−";
+  const NBSP = " ";
+  const NNBSP = " "; // French narrow no-break space, before % ; : ! ?
+
+  // --- Language: English or French, remembered, the browser's language at first ---
+
+  const LANGUAGES = ["en", "fr"];
+  const STORAGE_KEY = "euromillions-language";
+
+  function detectLanguage() {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (LANGUAGES.includes(saved)) return saved;
+    } catch (error) {
+      // Storage may be unavailable: fall back to the browser's language.
+    }
+    return (navigator.language || "").toLowerCase().startsWith("fr") ? "fr" : "en";
+  }
+
+  let lang = detectLanguage();
+
+  // ``tr(english, french)``: the text in the current language.
+  const tr = (en, fr) => (lang === "fr" ? fr : en);
+  const language = () => lang;
+  const locale = () => (lang === "fr" ? "fr-FR" : "en-GB");
+
+  const PAGES = [
+    ["index.html", ["Numbers", "Numéros"]],
+    ["patterns.html", ["Patterns", "Répartitions"]],
+    ["suggest.html", ["Suggest", "Suggestions"]],
+    ["backtest.html", ["Backtest", "Backtest"]],
+  ];
+
+  const STRATEGIES = {
+    hot: ["hot", "chauds", "Favour numbers drawn more often than expected in recent draws",
+      "Privilégie les numéros sortis plus souvent que prévu ces derniers tirages"],
+    cold: ["cold", "en retard", "Favour overdue numbers, those not drawn for the longest time",
+      "Privilégie les numéros en retard, absents depuis le plus longtemps"],
+    balanced: ["balanced", "équilibrée", "Hot and overdue numbers, with the usual odd/even and low/high mix",
+      "Numéros chauds et en retard, avec les répartitions pair/impair et bas/haut habituelles"],
+    weighted: ["weighted", "pondérée", "Weight numbers by frequency, overdue gap and pair affinity",
+      "Pondère les numéros selon leur fréquence, leur retard et leurs affinités par paires"],
+    anti: ["anti", "anti-motifs", "Uniformly random lines that avoid historically rare patterns",
+      "Grilles tirées au hasard qui évitent les profils rares par le passé"],
+    random: ["random (baseline)", "aléatoire (référence)", "Uniformly random lines", "Grilles tirées au hasard"],
+  };
+
+  const strategyName = (name) => (STRATEGIES[name] ? tr(STRATEGIES[name][0], STRATEGIES[name][1]) : name);
+  const strategyDescription = (name, fallback) =>
+    (STRATEGIES[name] ? tr(STRATEGIES[name][2], STRATEGIES[name][3]) : fallback);
+
+  const STOPPED = () => tr(
+    "The server has stopped: run `euromillions serve` again.",
+    `Le serveur s’est arrêté${NNBSP}: relancez \`euromillions serve\`.`);
 
   // --- Requests ---
 
@@ -25,13 +70,14 @@ const EM = (() => {
     try {
       response = await fetch(path, options);
     } catch (error) {
-      throw new Error(STOPPED);
+      throw new Error(STOPPED());
     }
     let data;
     try {
       data = await response.json();
     } catch (error) {
-      throw new Error(`Unexpected answer from the server (HTTP ${response.status}).`);
+      throw new Error(tr(`Unexpected answer from the server (HTTP ${response.status}).`,
+        `Réponse inattendue du serveur (HTTP ${response.status}).`));
     }
     if (!response.ok) {
       const error = new Error(data.error || `HTTP ${response.status}`);
@@ -81,40 +127,70 @@ const EM = (() => {
   };
   const icon = (name) => svg(ICONS[name]);
 
-  // --- Formatting ---
+  // --- Formatting, in the current language ---
 
-  const sign = (x) => (x > 0 ? "+" : x < 0 ? MINUS : "");
-  const signed = (x, digits = 1) => {
-    const rounded = Number(Math.abs(x).toFixed(digits));
-    return (rounded === 0 ? "" : sign(x)) + rounded.toFixed(digits);
-  };
+  // The absolute value, grouped and with ``digits`` decimals: 2,353.17 or 2 353,17.
   const num = (x, digits = 0) =>
-    Math.abs(x).toLocaleString("en-GB", { minimumFractionDigits: digits, maximumFractionDigits: digits });
-  // A minus sign, unless the amount shown rounds to zero.
+    Math.abs(x).toLocaleString(locale(), { minimumFractionDigits: digits, maximumFractionDigits: digits })
+      .replace(/ | /g, NNBSP);
+  // A minus sign, unless the figure shown rounds to zero.
   const negative = (x, text) => (x < 0 && /[1-9]/.test(text) ? MINUS + text : text);
-  const euro = (x, digits = 2) => negative(x, `€${num(x, digits)}`);
-  const pct = (share, digits = 1) => negative(share, `${num(share * 100, digits)}%`);
-  const signedPct = (share, digits = 1) => sign(share) + `${num(share * 100, digits)}%`;
-  const plural = (n, noun, many) => `${num(n)} ${n === 1 ? noun : many || `${noun}s`}`;
+  const fixed = (x, digits = 1) => negative(x, num(x, digits));
+  const signed = (x, digits = 1) => {
+    const text = num(x, digits);
+    if (!/[1-9]/.test(text)) return text;
+    return (x > 0 ? "+" : MINUS) + text;
+  };
+  const euro = (x, digits = 2) => negative(x, tr(`€${num(x, digits)}`, `${num(x, digits)}${NBSP}€`));
+  const percent = (text) => tr(`${text}%`, `${text}${NNBSP}%`);
+  const pct = (share, digits = 1) => negative(share, percent(num(share * 100, digits)));
+  const signedPct = (share, digits = 1) => percent(signed(share * 100, digits));
+  // Percentage points, for a spread around a percentage: "± 2.1 pts".
+  const points = (share, digits = 1) => tr(`${num(share * 100, digits)} pts`, `${num(share * 100, digits)}${NBSP}pts`);
   const capitalize = (text) => text.charAt(0).toUpperCase() + text.slice(1);
+
+  // ``count(3, "draw", "tirage")``: "3 draws" or "3 tirages". Irregular nouns are given as
+  // [singular, plural]. French puts 0 and 1 in the singular.
+  function count(n, en, fr) {
+    const forms = lang === "fr" ? fr : en;
+    const [one, many] = Array.isArray(forms) ? forms : [forms, `${forms}s`];
+    const singular = lang === "fr" ? Math.abs(n) < 2 : n === 1;
+    return `${num(n)}${lang === "fr" ? NBSP : " "}${singular ? one : many}`;
+  }
+
+  const MONTHS = {
+    en: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+    fr: ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."],
+  };
 
   function date(iso) {
     const [y, m, d] = iso.split("-").map(Number);
-    return `${d} ${MONTHS[m - 1]} ${y}`;
+    return `${d}${NBSP}${MONTHS[lang][m - 1]} ${y}`;
+  }
+
+  function monthYear(iso) {
+    const [y, m] = iso.split("-").map(Number);
+    return `${MONTHS[lang][m - 1]} ${y}`;
+  }
+
+  function longMonth(iso) {
+    const [y, m] = iso.split("-").map(Number);
+    return `${new Date(Date.UTC(y, m - 1, 15)).toLocaleString(locale(), { month: "long", timeZone: "UTC" })} ${y}`;
   }
 
   function parisParts(moment) {
-    const parts = new Intl.DateTimeFormat("en-GB", {
+    const parts = new Intl.DateTimeFormat(locale(), {
       timeZone: "Europe/Paris", weekday: "long", day: "numeric", month: "long", year: "numeric",
       hour: "2-digit", minute: "2-digit", hour12: false,
     }).formatToParts(moment);
     return Object.fromEntries(parts.map((part) => [part.type, part.value]));
   }
 
+  // "Friday 13 November 2026" / "Vendredi 13 novembre 2026"
   function longDate(iso) {
     const [y, m, d] = iso.split("-").map(Number);
     const parts = parisParts(new Date(Date.UTC(y, m - 1, d, 12)));
-    return `${parts.weekday} ${parts.day} ${parts.month} ${parts.year}`;
+    return capitalize(`${parts.weekday} ${parts.day} ${parts.month} ${parts.year}`);
   }
 
   function countdown(moment, now = new Date()) {
@@ -123,10 +199,11 @@ const EM = (() => {
     minutes -= days * 1440;
     const hours = Math.floor(minutes / 60);
     minutes -= hours * 60;
-    const shown = [[days, "day"], [hours, "hour"], [minutes, "minute"]]
+    const shown = [[days, "day", "jour"], [hours, "hour", "heure"], [minutes, "minute", "minute"]]
       .filter(([value]) => value)
-      .map(([value, unit]) => plural(value, unit));
-    return shown.length ? `in ${shown.slice(0, 2).join(" ")}` : "now";
+      .map(([value, en, fr]) => count(value, en, fr));
+    if (!shown.length) return tr("now", "maintenant");
+    return tr(`in ${shown.slice(0, 2).join(" ")}`, `dans ${shown.slice(0, 2).join(" ")}`);
   }
 
   function zBin(z) {
@@ -140,7 +217,7 @@ const EM = (() => {
   function ball(n, { star = false, size = "" } = {}) {
     return el("span", {
       class: ["ball", star ? "star" : "", size].filter(Boolean).join(" "),
-      "aria-label": star ? `Lucky Star ${n}` : `Number ${n}`,
+      "aria-label": star ? tr(`Lucky Star ${n}`, `Étoile ${n}`) : tr(`Number ${n}`, `Numéro ${n}`),
     }, String(n));
   }
 
@@ -154,6 +231,9 @@ const EM = (() => {
   // --- The frame of every page ---
 
   let status = null;
+  let active = "";
+  let titles = null;
+  let loader = null;
 
   function notice(message, kind = "") {
     const box = document.getElementById("notice");
@@ -163,12 +243,21 @@ const EM = (() => {
   }
 
   function fetchSummary(result) {
-    if (!result.downloaded) return "Already up to date.";
+    if (!result.downloaded) return tr("Already up to date.", "Déjà à jour.");
     const changes = [];
-    if (result.added) changes.push(`added ${plural(result.added, "new draw")}`);
-    if (result.updated) changes.push(`updated ${plural(result.updated, "draw")}`);
-    let text = capitalize(changes.join(", ") || "nothing new at the source") + ".";
-    if (result.unpublished) text += ` The draw of ${date(result.unpublished)} has not been published yet.`;
+    if (result.added) {
+      changes.push(tr(`added ${count(result.added, "new draw")}`,
+        `${count(result.added, ["nouveau tirage", "nouveaux tirages"])} ${result.added > 1 ? "ajoutés" : "ajouté"}`));
+    }
+    if (result.updated) {
+      changes.push(tr(`updated ${count(result.updated, "draw")}`,
+        `${count(result.updated, "tirage")} ${result.updated > 1 ? "mis à jour" : "mis à jour"}`));
+    }
+    let text = capitalize(changes.join(", ") || tr("nothing new at the source", "rien de nouveau à la source")) + ".";
+    if (result.unpublished) {
+      text += tr(` The draw of ${date(result.unpublished)} has not been published yet.`,
+        ` Le tirage du ${date(result.unpublished)} n’est pas encore publié.`);
+    }
     return text;
   }
 
@@ -176,68 +265,103 @@ const EM = (() => {
     button.disabled = true;
     const label = button.lastChild;
     const before = label.textContent;
-    label.textContent = "Updating…";
+    label.textContent = tr("Updating…", "Mise à jour…");
     try {
       const result = await send("POST", "/api/fetch", {});
       status = result.status;
-      renderHeader();
+      renderFrame();
       notice(fetchSummary(result));
       await reload();
     } catch (error) {
-      notice(`The data could not be updated: ${error.message}`, "error");
+      notice(tr(`The data could not be updated: ${error.message}`,
+        `Les données n’ont pas pu être mises à jour${NNBSP}: ${error.message}`), "error");
     } finally {
       button.disabled = false;
       label.textContent = before;
     }
   }
 
-  let active = "";
-  let loader = null;
+  async function switchLanguage(next) {
+    if (next === lang) return;
+    lang = next;
+    try {
+      localStorage.setItem(STORAGE_KEY, next);
+    } catch (error) {
+      // Not remembered, but the page still switches.
+    }
+    notice("");
+    renderFrame();
+    await reload();
+  }
+
+  function languageSwitch() {
+    return el("div", { class: "segmented small-segmented", role: "group", "aria-label": tr("Language", "Langue") },
+      [["en", "EN", "English"], ["fr", "FR", "Français"]].map(([code, short, name]) => el("button", {
+        type: "button", lang: code, title: name, "aria-label": name, "aria-pressed": String(lang === code),
+        onclick: () => switchLanguage(code),
+      }, short)));
+  }
 
   function renderHeader() {
     const header = document.getElementById("header");
     const summary = status && status.cache
-      ? `${plural(status.draws, "draw")} · ${date(status.first)} – ${date(status.last)}`
-      : "No draw history yet";
+      ? `${count(status.draws, "draw", "tirage")} · ${date(status.first)} – ${date(status.last)}`
+      : tr("No draw history yet", "Pas encore d’historique");
     const button = el("button", { type: "button", class: "button", onclick: () => update(button) },
-      icon("refresh"), el("span", {}, "Update data"));
+      icon("refresh"), el("span", {}, tr("Update data", "Mettre à jour")));
     header.replaceChildren(el("div", { class: "inner" },
       el("a", { class: "brand", href: "index.html" }, icon("logo"), "EuroMillions Analyzer"),
-      el("nav", { class: "nav", "aria-label": "Sections" },
-        PAGES.map(([href, name]) => el("a", { href, "aria-current": href === active ? "page" : null }, name))),
+      el("nav", { class: "nav", "aria-label": tr("Sections", "Rubriques") },
+        PAGES.map(([href, names]) => el("a", { href, "aria-current": href === active ? "page" : null }, tr(...names)))),
       el("div", { class: "data-status" },
         el("span", { class: "small muted" }, summary),
         status && status.cache && status.behind
-          ? el("span", { class: "small muted" }, "· the latest draw is missing")
+          ? el("span", { class: "small muted" }, tr("· the latest draw is missing", "· le dernier tirage manque"))
           : null,
-        button)));
+        button,
+        languageSwitch())));
   }
 
+  const DISCLAIMER_FR = "Les tirages sont aléatoires : les résultats passés ne permettent pas de prédire les suivants. " +
+    "À des fins éducatives et de divertissement uniquement.";
+
   function renderFooter() {
-    const lines = (status ? status.disclaimer : "").split("\n");
+    const english = (status ? status.disclaimer : "Lottery draws are random: past results cannot predict future ones.\n" +
+      "For educational and entertainment purposes only.").split("\n").join(" ");
     document.getElementById("footer").replaceChildren(
-      el("span", {}, lines.join(" ")),
-      el("span", {}, "Data: official draw archives of the French operator, cached on this computer."));
+      el("span", {}, tr(english, DISCLAIMER_FR.replace(" :", `${NNBSP}:`))),
+      el("span", {}, tr("Data: official draw archives of the French operator, cached on this computer.",
+        `Données${NNBSP}: archives officielles des tirages de la FDJ, conservées sur cet ordinateur.`)));
+  }
+
+  function renderFrame() {
+    document.documentElement.lang = lang;
+    if (titles) document.title = `${tr(...titles)} — EuroMillions Analyzer`;
+    renderHeader();
+    renderFooter();
   }
 
   function emptyState(container) {
     const button = el("button", { type: "button", class: "button primary", onclick: () => update(button) },
-      icon("refresh"), el("span", {}, "Download the history"));
+      icon("refresh"), el("span", {}, tr("Download the history", "Télécharger l’historique")));
     container.replaceChildren(el("section", { class: "card empty" },
-      el("h2", {}, "No draw history yet"),
-      el("p", { class: "muted" }, "Every draw since 2004 is downloaded from the official archives, in a few seconds. It is then kept on this computer."),
+      el("h2", {}, tr("No draw history yet", "Pas encore d’historique des tirages")),
+      el("p", { class: "muted" }, tr(
+        "Every draw since 2004 is downloaded from the official archives, in a few seconds. It is then kept on this computer.",
+        "Tous les tirages depuis 2004 sont téléchargés depuis les archives officielles, en quelques secondes, puis conservés sur cet ordinateur.")),
       button));
   }
 
   function errorState(container, error) {
     container.replaceChildren(el("section", { class: "card empty" },
-      el("h2", {}, "Something went wrong"),
+      el("h2", {}, tr("Something went wrong", "Un problème est survenu")),
       el("p", { class: "notice error" }, error.message)));
   }
 
   function disclaimer() {
     return el("p", { class: "disclaimer" }, icon("info"),
-      el("span", {}, "Draws are random. Everything here describes past draws; none of it predicts the next one."));
+      el("span", {}, tr("Draws are random. Everything here describes past draws; none of it predicts the next one.",
+        `Les tirages sont aléatoires. Tout ce qui figure ici décrit les tirages passés${NNBSP}; rien n’y prédit le prochain.`)));
   }
 
   async function reload() {
@@ -253,27 +377,29 @@ const EM = (() => {
     }
   }
 
-  // Start a page: ``load(status, container)`` fills ``#content`` once a history exists.
-  async function start(page, load) {
+  // Start a page: ``load(status, container)`` fills ``#content`` once a history exists. It is
+  // called again after an update of the data and after a change of language.
+  async function start(page, pageTitles, load) {
     active = page;
+    titles = pageTitles;
     loader = load;
-    renderHeader();
+    renderFrame();
     try {
       status = await get("/api/status");
     } catch (error) {
-      renderHeader();
+      renderFrame();
       errorState(document.getElementById("content"), error);
       return;
     }
-    renderHeader();
-    renderFooter();
+    renderFrame();
     await reload();
   }
 
   const currentStatus = () => status;
 
   return {
-    get, send, el, icon, ball, line, signed, num, euro, pct, signedPct, plural, capitalize,
-    date, longDate, parisParts, countdown, zBin, notice, disclaimer, start, currentStatus,
+    tr, language, get, send, el, icon, ball, line, num, fixed, signed, euro, pct, signedPct, points,
+    count, capitalize, date, monthYear, longMonth, longDate, parisParts, countdown, zBin, notice,
+    disclaimer, start, currentStatus, strategyName, strategyDescription, NNBSP,
   };
 })();

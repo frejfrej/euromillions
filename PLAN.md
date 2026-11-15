@@ -147,6 +147,9 @@ Check the hypotheses behind the strategies on data they have not seen, and measu
 - **Backtest**: the command line's settings, a progress bar with Cancel, and the result read against
   chance: winnings in the common ranks within two standard deviations, match z-scores below the
   threshold of a real edge.
+- In English or French: a switch in the header of every page, remembered by the browser, the
+  browser's language at first. Numbers and dates follow the language (2,353.17 € / 2 353,17 €).
+  Error messages raised by the analysis code stay in English.
 - Every figure is computed in Python, by the same functions as the command line (`web/api.py`); the
   pages only lay them out. The server only listens on 127.0.0.1 and refuses requests naming another
   host. No new dependency: `http.server` and plain HTML, CSS and JavaScript.
@@ -189,6 +192,7 @@ Where the implementation departs from the plan as first written, the text above 
 - **Gap analysis**: the plan said "average interval between appearances". The figure reported is the average number of draws *without* the number between two appearances, i.e. that interval minus one, so that it compares directly with the current and the longest gap.
 - **Structure**: `schedule.py`, `errors.py` and `__main__.py` were not in the planned structure; `pandas` is not used.
 - **Backtesting** (phase 6) was added to the plan while it was being implemented.
-- **Web UI** (phase 7) was added afterwards. It does not expose `analyze --last` (every figure limited to
-  the last N draws) nor `--top`: rankings show their first entries, and the recent window is chosen among
-  50, 100 and 200 draws.
+- **Web UI** (phase 7) was added afterwards, then made available in French (the design had listed
+  translations as a non-goal). It does not expose `analyze --last` (every figure limited to
+  the last N draws) nor `--top`: rankings show their first 6 entries (3 for the stars), and the recent
+  window is chosen among 50, 100 and 200 draws.

@@ -32,7 +32,8 @@ wins.
 
 - Hosting, remote access, several users, accounts.
 - New statistics or strategies (a strategy avoiding popular numbers is a separate project).
-- Dark mode, translations (English, like the CLI), a phone-first design. Pages must still not
+- Dark mode, a phone-first design. (Translations were a non-goal too; French was added afterwards,
+  at the user's request.) Pages must still not
   break at phone width: the sketch's layouts already wrap.
 - Any JavaScript tooling: no npm, no framework, no bundler, no build step.
 

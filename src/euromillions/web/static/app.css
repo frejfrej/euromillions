@@ -229,7 +229,7 @@ table.data tr.chance { color: var(--ink-2); font-style: italic; }
   cursor: pointer; text-align: left; background: var(--bg); border: 2px solid transparent;
 }
 .strategy-option[aria-pressed="true"] { background: var(--white); border-color: var(--ink); }
-.strategy-option .name { font-weight: 650; text-transform: capitalize; }
+.strategy-option .name { font-weight: 650; }
 .pill {
   min-width: 48px; min-height: 44px; border-radius: 8px; cursor: pointer; font-weight: 650;
   background: var(--white); border: 1px solid var(--line-strong);
@@ -254,3 +254,6 @@ ul.reading { margin: 0; padding-left: 20px; display: flex; flex-direction: colum
   .dotplot .dot-row { grid-template-columns: 96px minmax(0, 1fr) 84px; }
   .data-status { margin-left: 0; }
 }
+
+/* The language switch in the header. */
+.small-segmented button { padding: 0 12px; font-weight: 650; }
