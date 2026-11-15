@@ -21,6 +21,7 @@ from euromillions.analyzer import (
 )
 from euromillions.backtest import Backtest
 from euromillions.errors import EuromillionsError
+from euromillions.models import DISCLAIMER as DISCLAIMER  # also re-exported
 from euromillions.models import (
     LINE_PRICE,
     MAIN_COUNT,
@@ -30,11 +31,6 @@ from euromillions.models import (
     STAR_MAX,
     BallKind,
     Draw,
-)
-
-DISCLAIMER = (
-    "Lottery draws are random: past results cannot predict future ones.\n"
-    "For educational and entertainment purposes only."
 )
 
 _WIDTH = 80
@@ -349,15 +345,8 @@ def _render_number_rankings(
     window: int,
     top: int,
 ) -> list[str]:
-    # Ranked by z-score, i.e. against what each number could be expected to do: raw counts
-    # would be unfair to the stars that joined the pool later. Half of the pool at most, so
-    # that no number is listed as both most and least drawn.
     drawn = [s for s in stats.values() if s.eligible_draws]
-    shown = min(top, len(drawn) // 2)
-    most_drawn = sorted(drawn, key=lambda s: (-s.z_score, s.number))[:shown]
-    least_drawn = [
-        s for s in sorted(drawn, key=lambda s: (s.z_score, s.number)) if s not in most_drawn
-    ]
+    most_drawn, least_drawn = analyzer.most_and_least_drawn(stats, top)
 
     def entries(ranking: Iterable[NumberStats]) -> Iterable[str]:
         return (f"{s.number} ({s.count}x, {s.z_score:+.1f})" for s in ranking)
@@ -365,7 +354,7 @@ def _render_number_rankings(
     lines = [
         title,
         _ranking("Most drawn", entries(most_drawn)),
-        _ranking("Least drawn", entries(least_drawn[:shown])),
+        _ranking("Least drawn", entries(least_drawn)),
         _ranking(f"Hot, last {window}", entries(hot)),
         _ranking(f"Cold, last {window}", entries(cold)),
         _ranking(

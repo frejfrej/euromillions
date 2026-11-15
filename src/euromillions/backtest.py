@@ -340,6 +340,21 @@ def backtest(
     )
 
 
+def min_train_fraction(draws: Iterable[Draw]) -> float | None:
+    """Return the smallest ``train_fraction`` that :func:`backtest` accepts for ``draws``.
+
+    The evaluation has to start under the current rules, and the training set needs one
+    draw at least. The fraction is rounded up as in the error :func:`backtest` raises for a
+    smaller one. ``None`` when no split can be evaluated: no draw under the current rules,
+    or fewer than two draws.
+    """
+    history = chronological(draws)
+    older = sum(draw.date < CURRENT_RULES_SINCE for draw in history)
+    if len(history) < 2 or older >= len(history):
+        return None
+    return float(_round_up(max(older, 1) / len(history)))
+
+
 def _round_up(fraction: float) -> str:
     """Format a fraction below 1 rounded up, with as few decimals (from three) as keep it so."""
     for decimals in range(3, 10):

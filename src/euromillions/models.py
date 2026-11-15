@@ -13,6 +13,12 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 #: Main numbers drawn per draw, and the size of their pool (1-50, unchanged since 2004).
+#: Said with every result, by every front end.
+DISCLAIMER = (
+    "Lottery draws are random: past results cannot predict future ones.\n"
+    "For educational and entertainment purposes only."
+)
+
 MAIN_COUNT = 5
 MAIN_MAX = 50
 

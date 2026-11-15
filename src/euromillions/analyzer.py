@@ -21,7 +21,7 @@ import datetime as dt
 import math
 import statistics
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from itertools import combinations, pairwise
@@ -221,6 +221,23 @@ def number_stats(draws: Iterable[Draw], kind: BallKind = "main") -> dict[int, Nu
             stats[number] = _number_stats(number, hits, eligible, expected, variance)
         smaller_pool = size
     return stats
+
+
+def most_and_least_drawn(
+    stats: Mapping[int, NumberStats], top: int
+) -> tuple[list[NumberStats], list[NumberStats]]:
+    """Return the ``top`` most and least drawn numbers of ``stats``, most extreme first.
+
+    They are ranked by z-score, i.e. against what each number could be expected to do: raw
+    counts would be unfair to the stars that joined the pool later. Numbers never eligible
+    are left out, and each list holds half of the others at most, so that no number is
+    listed as both most and least drawn.
+    """
+    drawn = [s for s in stats.values() if s.eligible_draws]
+    shown = min(top, len(drawn) // 2)
+    most = sorted(drawn, key=lambda s: (-s.z_score, s.number))[:shown]
+    least = [s for s in sorted(drawn, key=lambda s: (s.z_score, s.number)) if s not in most]
+    return most, least[:shown]
 
 
 def hot_numbers(
