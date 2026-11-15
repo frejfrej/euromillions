@@ -21,7 +21,7 @@ import datetime as dt
 import math
 import statistics
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from itertools import combinations, pairwise
@@ -29,6 +29,7 @@ from itertools import combinations, pairwise
 from euromillions.errors import HistoryError
 from euromillions.models import (
     MAIN_COUNT,
+    MAIN_MAX,
     BallKind,
     Draw,
     chronological,
@@ -220,6 +221,23 @@ def number_stats(draws: Iterable[Draw], kind: BallKind = "main") -> dict[int, Nu
             stats[number] = _number_stats(number, hits, eligible, expected, variance)
         smaller_pool = size
     return stats
+
+
+def most_and_least_drawn(
+    stats: Mapping[int, NumberStats], top: int
+) -> tuple[list[NumberStats], list[NumberStats]]:
+    """Return the ``top`` most and least drawn numbers of ``stats``, most extreme first.
+
+    They are ranked by z-score, i.e. against what each number could be expected to do: raw
+    counts would be unfair to the stars that joined the pool later. Numbers never eligible
+    are left out, and each list holds half of the others at most, so that no number is
+    listed as both most and least drawn.
+    """
+    drawn = [s for s in stats.values() if s.eligible_draws]
+    shown = min(top, len(drawn) // 2)
+    most = sorted(drawn, key=lambda s: (-s.z_score, s.number))[:shown]
+    least = [s for s in sorted(drawn, key=lambda s: (s.z_score, s.number)) if s not in most]
+    return most, least[:shown]
 
 
 def hot_numbers(
@@ -455,6 +473,30 @@ def typical_top_count(draws: int, chance: float, candidates: int) -> int:
         below += probability
         probability *= (draws - count) / (count + 1) * chance / (1 - chance)
     return draws
+
+
+def fair_split_shares() -> dict[int, float]:
+    """Return the probability that ``k`` of the main numbers of a fair draw are odd, by ``k``.
+
+    Half of the pool is odd, so ``k`` follows a hypergeometric law. Low numbers (1 to
+    :data:`LOW_MAX`) are half of the pool too: the same law gives the low/high split.
+    """
+    half = MAIN_MAX // 2
+    lines = math.comb(MAIN_MAX, MAIN_COUNT)
+    return {
+        k: math.comb(half, k) * math.comb(MAIN_MAX - half, MAIN_COUNT - k) / lines
+        for k in range(MAIN_COUNT + 1)
+    }
+
+
+def fair_consecutive_share() -> float:
+    """Return the probability that a fair draw holds at least two consecutive main numbers.
+
+    Lines without any two consecutive numbers correspond one to one to the choice of
+    ``MAIN_COUNT`` numbers among ``MAIN_MAX - MAIN_COUNT + 1``.
+    """
+    apart = math.comb(MAIN_MAX - MAIN_COUNT + 1, MAIN_COUNT)
+    return 1 - apart / math.comb(MAIN_MAX, MAIN_COUNT)
 
 
 # --- Full report --------------------------------------------------------------------------------

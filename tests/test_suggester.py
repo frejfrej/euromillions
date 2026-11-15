@@ -12,7 +12,16 @@ from euromillions import analyzer
 from euromillions import suggester as suggester_module
 from euromillions.errors import HistoryError
 from euromillions.models import Draw, Suggestion
-from euromillions.suggester import BASELINE, STRATEGIES, _rank_weights, _weighted_sample, suggest
+from euromillions.suggester import (
+    BASELINE,
+    STRATEGIES,
+    WINDOW_STRATEGIES,
+    _rank_weights,
+    _weighted_sample,
+    suggest,
+)
+
+from .conftest import random_history
 
 ALL_STRATEGIES = list(STRATEGIES)
 
@@ -413,3 +422,13 @@ class TestHelpers:
         weights = {1: 1.0, 2: 0.0, 3: 1.0, 4: 1.0}
         for _ in range(200):
             assert set(_weighted_sample(rng, weights, 2, exclude=[4])) == {1, 3}
+
+
+def test_window_strategies() -> None:
+    assert WINDOW_STRATEGIES == {"hot", "balanced"}
+    history = random_history(120)
+    for name in STRATEGIES:
+        if name not in WINDOW_STRATEGIES:
+            assert suggest(history, name, lines=3, window=5, seed=1) == suggest(
+                history, name, lines=3, window=50, seed=1
+            )

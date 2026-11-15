@@ -17,9 +17,9 @@ import datetime as dt
 import math
 import random
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from statistics import fmean
+from statistics import NormalDist, fmean
 
 from euromillions import suggester
 from euromillions.analyzer import DEFAULT_WINDOW
@@ -71,6 +71,49 @@ EXPECTED_MATCHES: dict[BallKind, float] = {
 #: other rank is won at each draw: these "common" ranks are all a backtest realistically hits.
 TOP_RANKS = 3
 COMMON_RANKS: tuple[int, ...] = tuple(sorted(PRIZE_RANKS.values()))[TOP_RANKS:]
+
+#: Called with ``(done, total)`` as a backtest plays its draws; see :func:`backtest`.
+ProgressCallback = Callable[[int, int], None]
+
+# --- How to read a backtest ---------------------------------------------------------------------
+#
+# Shared by every report of a backtest (the command line, the web pages), so that they all
+# read the same result the same way.
+
+#: Below this many lines per strategy, luck dominates the figures of a backtest.
+FEW_LINES = 1000
+
+_NORMAL = NormalDist()
+
+#: Probability that a z-score lands beyond +/-2 by chance alone (about 1 in 22).
+Z_BEYOND_TWO = 2 * (1 - _NORMAL.cdf(2))
+
+#: One line in this many wins one of the :data:`TOP_RANKS` top ranks (about 2.1 million).
+TOP_RANK_ODDS = 1 / sum(RANK_PROBABILITIES[rank] for rank in range(1, TOP_RANKS + 1))
+
+
+def chance_of_extreme_z(count: int) -> float:
+    """Return the probability that at least one of ``count`` z-scores lands beyond +/-2."""
+    return 1 - (1 - Z_BEYOND_TWO) ** count
+
+
+def edge_threshold(count: int) -> float:
+    """Return how far one of ``count`` z-scores must go to point to a real edge.
+
+    It is the level that any of them passes by chance in 5% of the backtests only
+    (a Bonferroni correction): about 2.9 for 12 z-scores.
+    """
+    return _NORMAL.inv_cdf(1 - 0.05 / (2 * count))
+
+
+def win_rate_sd(lines: int) -> float:
+    """Return the standard deviation of the share of winning lines among ``lines`` random ones."""
+    return math.sqrt(WIN_PROBABILITY * (1 - WIN_PROBABILITY) / lines)
+
+
+def expected_wins(lines: int) -> dict[int, float]:
+    """Return how many of ``lines`` random lines are expected to win each prize rank."""
+    return {rank: lines * probability for rank, probability in RANK_PROBABILITIES.items()}
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +227,7 @@ def backtest(
     seed: int | None = None,
     refresh: bool = True,
     line_price: float = LINE_PRICE,
+    progress: ProgressCallback | None = None,
 ) -> Backtest:
     """Play ``strategies`` on the most recent part of the history and report the outcome.
 
@@ -199,6 +243,11 @@ def backtest(
     had other pools and prize ranks, and only those that carry their prize
     data. ``line_price`` defaults to the price of a line in France, which
     includes a raffle entry that is not simulated here.
+
+    ``progress``, if given, is called with ``(done, total)`` after each draw played by
+    each strategy, ``total`` being the number of strategies times the number of draws
+    played. An exception it raises stops the backtest and propagates: that is how a
+    caller cancels one.
 
     Raises :class:`ValueError` for an invalid argument, and its subclass
     :class:`~euromillions.errors.HistoryError` when the history cannot be split
@@ -246,6 +295,15 @@ def backtest(
             "to download it"
         )
 
+    total = len(strategies) * len(scored)
+    done = 0
+
+    def played_one() -> None:
+        nonlocal done
+        done += 1
+        if progress is not None:
+            progress(done, total)
+
     results = [
         _play(
             name,
@@ -258,6 +316,7 @@ def backtest(
             line_price=line_price,
             # One independent, reproducible stream per strategy, whichever others are evaluated.
             rng=random.Random(None if seed is None else f"{seed}:{name}"),
+            on_draw=played_one,
         )
         for name in strategies
     ]
@@ -279,6 +338,21 @@ def backtest(
         chance_winnings_sd=chance_winnings_sd,
         results=results,
     )
+
+
+def min_train_fraction(draws: Iterable[Draw]) -> float | None:
+    """Return the smallest ``train_fraction`` that :func:`backtest` accepts for ``draws``.
+
+    The evaluation has to start under the current rules, and the training set needs one
+    draw at least. The fraction is rounded up as in the error :func:`backtest` raises for a
+    smaller one. ``None`` when no split can be evaluated: no draw under the current rules,
+    or fewer than two draws.
+    """
+    history = chronological(draws)
+    older = sum(draw.date < CURRENT_RULES_SINCE for draw in history)
+    if len(history) < 2 or older >= len(history):
+        return None
+    return float(_round_up(max(older, 1) / len(history)))
 
 
 def _round_up(fraction: float) -> str:
@@ -314,6 +388,7 @@ def _play(
     refresh: bool,
     line_price: float,
     rng: random.Random,
+    on_draw: Callable[[], None],
 ) -> StrategyResult:
     """Play one strategy on the draws at the ``scored`` indexes of ``history``.
 
@@ -357,6 +432,7 @@ def _play(
             estimated_wins += count if estimated else 0
             if best_win is None or amount > best_win.amount:
                 best_win = Win(draw.date, rank, amount)
+        on_draw()
 
     total_lines = lines * len(scored)
     z_scores = {

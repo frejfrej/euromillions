@@ -236,12 +236,18 @@ def _random(_draws: list[Draw], _window: int) -> _Generator:
 class _Strategy(NamedTuple):
     description: str
     build: Callable[[list[Draw], int], _Generator]
+    #: Whether the lines depend on the recent window.
+    uses_window: bool = False
 
 
 _STRATEGIES: dict[str, _Strategy] = {
-    "hot": _Strategy("favour numbers drawn more often than expected in recent draws", _hot),
+    "hot": _Strategy(
+        "favour numbers drawn more often than expected in recent draws", _hot, uses_window=True
+    ),
     "cold": _Strategy("favour overdue numbers, those not drawn for the longest time", _cold),
-    "balanced": _Strategy("hot and overdue numbers, usual odd/even and low/high mix", _balanced),
+    "balanced": _Strategy(
+        "hot and overdue numbers, usual odd/even and low/high mix", _balanced, uses_window=True
+    ),
     "weighted": _Strategy("weight numbers by frequency, overdue gap and pair affinity", _weighted),
     "anti": _Strategy("uniformly random lines that avoid historically rare patterns", _anti),
     BASELINE: _Strategy("uniformly random lines", _random),
@@ -251,6 +257,11 @@ _STRATEGIES: dict[str, _Strategy] = {
 STRATEGIES: dict[str, str] = {
     name: strategy.description for name, strategy in _STRATEGIES.items() if name != BASELINE
 }
+
+#: The strategies whose lines depend on the recent window (the others ignore it).
+WINDOW_STRATEGIES: frozenset[str] = frozenset(
+    name for name, strategy in _STRATEGIES.items() if strategy.uses_window
+)
 
 
 def suggest(

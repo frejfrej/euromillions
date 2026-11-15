@@ -1,11 +1,13 @@
-"""Command-line interface: ``euromillions fetch | analyze | suggest | backtest | next-draw``."""
+"""Command-line interface: ``euromillions fetch | analyze | suggest | backtest | next-draw``,
+and ``serve`` for the web pages."""
 
 from __future__ import annotations
 
 import datetime as dt
+import errno
 import math
-import statistics
 import textwrap
+import webbrowser
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,7 @@ from euromillions.analyzer import (
 )
 from euromillions.backtest import Backtest
 from euromillions.errors import EuromillionsError
+from euromillions.models import DISCLAIMER as DISCLAIMER  # also re-exported
 from euromillions.models import (
     LINE_PRICE,
     MAIN_COUNT,
@@ -32,19 +35,13 @@ from euromillions.models import (
     BallKind,
     Draw,
 )
-
-DISCLAIMER = (
-    "Lottery draws are random: past results cannot predict future ones.\n"
-    "For educational and entertainment purposes only."
-)
+from euromillions.web import server as web_server
 
 _WIDTH = 80
 _LABEL_WIDTH = 18
 _UTC = dt.timezone.utc
 #: Lines suggested, or played on each draw of a backtest, unless told otherwise.
 _DEFAULT_LINES = 5
-#: Below this many lines per strategy, a backtest says very little.
-_FEW_LINES = 1000
 #: (main numbers, Lucky Stars) to match for each prize rank.
 _RANK_MATCHES = {rank: matches for matches, rank in PRIZE_RANKS.items()}
 
@@ -273,6 +270,46 @@ def next_draw() -> None:
     )
 
 
+@cli.command()
+@click.option(
+    "--port",
+    type=click.IntRange(0, 65535),
+    default=8000,
+    show_default=True,
+    help="Port to listen on (0: any free port).",
+)
+@click.option("--no-browser", is_flag=True, help="Do not open the pages in the browser.")
+@click.pass_obj
+def serve(cache_path: Path, port: int, no_browser: bool) -> None:
+    """Show the analysis, suggestions and backtests in the browser.
+
+    The pages are only served to this computer (127.0.0.1). Press Ctrl+C to stop.
+    """
+    has_history = bool(fetcher.load_draws(cache_path))  # a corrupt cache is reported now
+    try:
+        httpd = web_server.make_server(cache_path, port)
+    except OSError as exc:
+        if exc.errno in {errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", None)}:
+            raise click.ClickException(
+                f"port {port} is already in use: choose another one with --port"
+            ) from exc
+        raise
+    url = f"http://127.0.0.1:{httpd.server_address[1]}/"
+    click.echo(f"Serving on {url} - press Ctrl+C to stop.")
+    if not has_history:
+        click.echo(
+            f"No draw history yet in {cache_path.resolve()}: the pages offer to download it."
+        )
+    if not no_browser:
+        webbrowser.open(url)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        click.echo("Stopped.")
+    finally:
+        httpd.server_close()
+
+
 def _load_draws(cache_path: Path) -> list[Draw]:
     """Read the cached history; without any, tell the user how to get one."""
     draws = fetcher.load_draws(cache_path)
@@ -352,15 +389,8 @@ def _render_number_rankings(
     window: int,
     top: int,
 ) -> list[str]:
-    # Ranked by z-score, i.e. against what each number could be expected to do: raw counts
-    # would be unfair to the stars that joined the pool later. Half of the pool at most, so
-    # that no number is listed as both most and least drawn.
     drawn = [s for s in stats.values() if s.eligible_draws]
-    shown = min(top, len(drawn) // 2)
-    most_drawn = sorted(drawn, key=lambda s: (-s.z_score, s.number))[:shown]
-    least_drawn = [
-        s for s in sorted(drawn, key=lambda s: (s.z_score, s.number)) if s not in most_drawn
-    ]
+    most_drawn, least_drawn = analyzer.most_and_least_drawn(stats, top)
 
     def entries(ranking: Iterable[NumberStats]) -> Iterable[str]:
         return (f"{s.number} ({s.count}x, {s.z_score:+.1f})" for s in ranking)
@@ -368,7 +398,7 @@ def _render_number_rankings(
     lines = [
         title,
         _ranking("Most drawn", entries(most_drawn)),
-        _ranking("Least drawn", entries(least_drawn[:shown])),
+        _ranking("Least drawn", entries(least_drawn)),
         _ranking(f"Hot, last {window}", entries(hot)),
         _ranking(f"Cold, last {window}", entries(cold)),
         _ranking(
@@ -584,7 +614,7 @@ def _render_backtest(report: Backtest) -> list[str]:
             f"{report.chance_winnings_sd:,.2f}",
             f"{report.chance_winnings_sd:,.2f}",
             f"{report.chance_winnings_sd / cost:.1%}",
-            f"{math.sqrt(win * (1 - win) / played):.1%}",
+            f"{backtest.win_rate_sd(played):.1%}",
             "",
             "",
         ).rstrip(),
@@ -594,11 +624,7 @@ def _render_backtest(report: Backtest) -> list[str]:
     ]
 
     z_scores = 2 * len(report.results)
-    normal = statistics.NormalDist()
-    beyond_two = 2 * (1 - normal.cdf(2))
-    top_odds = 1 / sum(
-        backtest.RANK_PROBABILITIES[rank] for rank in range(1, backtest.TOP_RANKS + 1)
-    )
+    beyond_two = backtest.Z_BEYOND_TWO
     notes = [
         "Amounts are in euros. ROI is the net result over the cost; Wins is the share of "
         "lines that won a prize.",
@@ -610,12 +636,13 @@ def _render_backtest(report: Backtest) -> list[str]:
         "Numbers and Stars: average matches per line, with the z-score against pure chance "
         f"in brackets. Chance alone puts a z-score beyond +/-2 about once in "
         f"{1 / beyond_two:.0f}: with {z_scores} of them here, at least one in about "
-        f"{1 - (1 - beyond_two) ** z_scores:.0%} of backtests. Only a value beyond about "
-        f"+/-{normal.inv_cdf(1 - 0.05 / (2 * z_scores)):.1f} that holds with other seeds "
+        f"{backtest.chance_of_extreme_z(z_scores):.0%} of backtests. Only a value beyond about "
+        f"+/-{backtest.edge_threshold(z_scores):.1f} that holds with other seeds "
         "and periods would point to a real edge, and a small one could go unnoticed.",
         f"The {backtest.TOP_RANKS} top ranks, jackpot included, hold about half of the "
-        f"prize money, but a line wins one of them about once in {top_odds / 1e6:.1f} million "
-        "times: far too rare for a backtest to measure."
+        "prize money, but a line wins one of them about once in "
+        f"{backtest.TOP_RANK_ODDS / 1e6:.1f} million times: far too rare for a backtest to "
+        "measure."
         + (
             " The cost includes EUR 0.30 per line for the My Million raffle, which is not "
             "simulated; by design, the draw returns half of the other EUR 2.20 in prizes "
@@ -636,9 +663,10 @@ def _render_backtest(report: Backtest) -> list[str]:
             "money aside before comparing, and read it as luck that every line had the same "
             "chance of."
         )
-    if played < _FEW_LINES:
+    if played < backtest.FEW_LINES:
         notes.append(
-            f"With fewer than {_FEW_LINES} lines per strategy, luck dominates these figures."
+            f"With fewer than {backtest.FEW_LINES} lines per strategy, luck dominates these "
+            "figures."
         )
     estimated = sum(result.estimated_wins for result in report.results)
     if estimated:
@@ -673,8 +701,10 @@ def _render_wins_by_rank(report: Backtest) -> list[str]:
     def row(name: str, cells: Iterable[str]) -> str:
         return f"{name:<9}" + "".join(f"{cell:>5}" for cell in cells)
 
+    chance = backtest.expected_wins(played)
+
     def expected(rank: int) -> str:
-        count = played * backtest.RANK_PROBABILITIES[rank]
+        count = chance[rank]
         return f"{count:.0f}" if count >= 100 else f"{count:.1f}"
 
     return [
