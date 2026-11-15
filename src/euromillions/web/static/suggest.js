@@ -37,6 +37,7 @@
 
   async function suggest() {
     const mine = ++request;
+    const picked = state.seed === null; // the server picks the seed: show it in the field
     const query = new URLSearchParams({ strategy: state.strategy, lines: state.lines, window: state.window });
     if (state.seed !== null) query.set("seed", state.seed);
     try {
@@ -49,15 +50,24 @@
       if (mine !== request) return;
       error = failure.message;
     }
-    render();
+    renderResults();
+    const seed = document.getElementById("seed");
+    if (seed && picked && state.seed !== null) seed.value = state.seed;
   }
 
-  // Settings change the lines at once; typing in the seed waits for a pause.
-  function change(update, { wait = 0 } = {}) {
+  // Settings change the lines at once. Typing in the seed waits for a pause, and leaves the
+  // field alone: rebuilding it under the caret would scramble what is being typed.
+  function change(update, { wait = 0, redraw = true } = {}) {
     Object.assign(state, update, { copied: false });
     clearTimeout(timer);
-    render();
+    if (redraw) render();
     timer = setTimeout(suggest, wait);
+  }
+
+  function renderResults() {
+    const box = document.getElementById("results");
+    if (box) box.replaceChildren(lines(), expect());
+    else render(); // the first time: draw the whole page
   }
 
   function render() {
@@ -68,7 +78,7 @@
         el("p", {}, "Pick a strategy: the lines update as you change the settings. The same seed always gives the same lines.")),
       el("div", { class: "split" },
         el("div", { class: "side", style: "flex-basis: 340px" }, settings()),
-        el("div", { class: "wide", style: "gap: 16px" }, lines(), expect())));
+        el("div", { class: "wide", id: "results", style: "gap: 16px" }, lines(), expect())));
     if (focused) {
       const again = container.querySelector(`[data-focus="${focused}"]`);
       if (again) again.focus();
@@ -90,7 +100,7 @@
       "data-focus": "seed", "aria-describedby": "seedHint", style: "flex: 1; min-width: 0",
       oninput: (event) => {
         const text = event.target.value.trim();
-        if (/^-?\d+$/.test(text)) change({ seed: Number(text) }, { wait: 400 });
+        if (/^-?\d+$/.test(text)) change({ seed: Number(text) }, { wait: 400, redraw: false });
       },
     });
     return el("section", { class: "card", "aria-label": "Settings", style: "gap: 24px" },
@@ -132,7 +142,7 @@
     try {
       await navigator.clipboard.writeText(text);
       state.copied = true;
-      render();
+      renderResults();
     } catch (failure) {
       EM.notice("The browser did not let the page copy: select the lines and copy them by hand.", "error");
     }
