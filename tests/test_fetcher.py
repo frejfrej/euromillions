@@ -16,7 +16,9 @@ import zipfile
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 import requests
@@ -55,9 +57,9 @@ class Redirect:
     location: str
 
 
-#: What a fake website answers: the body of a 200 response, an HTTP error status, a
-#: redirection, or an exception to raise.
-Outcome = bytes | int | Redirect | Exception
+#: What a fake website answers: the body of a 200 response (as bytes, or as a stream to
+#: read it from), an HTTP error status, a redirection, or an exception to raise.
+Outcome = bytes | io.BytesIO | int | Redirect | Exception
 
 #: The tolerance of the real completeness check, before any test relaxes it.
 REAL_MAX_GAP = fetcher._MAX_GAP
@@ -259,7 +261,10 @@ class FakeTransport(BaseAdapter):
             response.headers["Location"] = outcome.location
         else:
             response.status_code = outcome if isinstance(outcome, int) else 200
-        response.raw = io.BytesIO(outcome if isinstance(outcome, bytes) else b"")
+        if isinstance(outcome, io.BytesIO):
+            response.raw = outcome
+        else:
+            response.raw = io.BytesIO(outcome if isinstance(outcome, bytes) else b"")
         return response
 
     def close(self) -> None:
@@ -696,6 +701,42 @@ def test_endless_responses_are_refused(monkeypatch: pytest.MonkeyPatch) -> None:
         discover_archive_urls(session)
 
 
+class Trickle(io.BytesIO):
+    """A response body of which every block read takes one second of a fake clock."""
+
+    def __init__(self, content: bytes) -> None:
+        super().__init__(content)
+        self.seconds = 0.0
+        self.served = 0
+
+    def read(self, size: int | None = -1) -> bytes:
+        self.seconds += 1.0
+        data = super().read(size)
+        self.served += len(data)
+        return data
+
+
+def test_a_response_that_trickles_in_is_given_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The whole response may take two and a half seconds; this one would take thirteen.
+    body = Trickle(bytes(100_000))
+    monkeypatch.setattr(fetcher, "time", SimpleNamespace(monotonic=lambda: body.seconds))
+    monkeypatch.setattr(fetcher, "_MAX_DOWNLOAD_SECONDS", 2.5)
+    session, _ = fake_session({HISTORY_PAGE_URL: body})
+    with pytest.raises(FetchError, match="no complete response within the time allowed"):
+        discover_archive_urls(session)
+    # Noticed at the first block that completes past the limit, not at the end.
+    assert body.served == 3 * fetcher._BLOCK_BYTES < 100_000
+
+
+def test_a_response_within_the_time_allowed_is_read_to_the_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = Trickle(read_fixture("history_page.html"))
+    monkeypatch.setattr(fetcher, "time", SimpleNamespace(monotonic=lambda: body.seconds))
+    session, _ = fake_session({HISTORY_PAGE_URL: body})
+    assert discover_archive_urls(session) == list(reversed(KNOWN_ARCHIVE_URLS))
+
+
 @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
 def test_redirects_are_refused_not_followed(status: int) -> None:
     elsewhere = "http://mirror.example.net/euromillions.zip"
@@ -869,10 +910,24 @@ def test_fetch_draws_rejects_a_draw_dated_off_schedule(full_history: list[Draw])
 
 def test_fetch_draws_rejects_a_draw_dated_in_the_future(full_history: list[Draw]) -> None:
     session, _ = fake_session(site_serving(full_history))
-    # On Friday the 13th before the draw, the latest draw is that of Tuesday the 10th.
+    # The latest draw is dated Friday the 13th: on the Thursday, it cannot have taken place.
     with pytest.raises(FetchError, match="2026-11-13 is in the future"):
-        fetch_draws(session, now=paris(2026, 11, 13, 21, 4))
+        fetch_draws(session, now=paris(2026, 11, 12, 23, 59))
+    # The day that counts is that of Paris, where it is still Thursday.
+    auckland = dt.datetime(2026, 11, 13, 0, 30, tzinfo=ZoneInfo("Pacific/Auckland"))
+    with pytest.raises(FetchError, match="2026-11-13 is in the future"):
+        fetch_draws(session, now=auckland)
     assert fetch_draws(session, now=paris(2026, 11, 13, 21, 5)) == full_history
+
+
+def test_fetch_draws_accepts_a_draw_published_before_its_scheduled_time(
+    full_history: list[Draw],
+) -> None:
+    # 21:05 is only the usual time of the draw: a result out earlier that day is no mistake,
+    # and refusing it would make the whole download fail.
+    session, _ = fake_session(site_serving(full_history))
+    assert fetch_draws(session, now=paris(2026, 11, 13, 20, 55)) == full_history
+    assert fetch_draws(session, now=paris(2026, 11, 13, 0, 0)) == full_history
 
 
 def test_fetch_draws_sends_no_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1085,6 +1140,7 @@ def test_save_draws_writes_through_a_symbolic_link(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "now",
     [
+        paris(2026, 11, 13, 20, 55),  # the draw of that Friday was published a little early
         paris(2026, 11, 13, 21, 5),  # the draw of Friday the 13th has just taken place
         paris(2026, 11, 14),
         paris(2026, 11, 17, 21, 4),  # a minute before the next draw

@@ -121,7 +121,7 @@ Check the hypotheses behind the strategies on data they have not seen, and measu
 - Split the history: the oldest part (80% by default) only serves to build statistics, the rest is the evaluation set.
 - Play every evaluated draw with lines suggested from the draws that precede it (statistics updated before each draw, or frozen on the training set with `--static`). No line ever depends on the draw it is scored on.
 - Score the lines with the prizes really paid that day for each rank, shared with the actual winners; report cost, winnings, net result and return on stake per strategy.
-- Compare every strategy with a uniformly random baseline and with pure chance: expected winnings of random lines on the same draws (with their standard deviation), share of winning lines, average numbers and stars matched per line with exact z-scores, wins per prize rank.
+- Compare every strategy with a uniformly random baseline and with pure chance: expected winnings of random lines on the same draws from prize ranks 4 to 13 (with their standard deviation), share of winning lines, average numbers and stars matched per line with exact z-scores, wins per prize rank. A win in the three top ranks is far too rare to be expected: it is reported apart, as luck.
 - Say how to read the result: with a dozen z-scores on screen, one beyond ±2 is expected in about four backtests out of ten; only a much larger value that holds across seeds and periods would point to predictive power. On the real history, every strategy loses about 80% of the stakes, like random lines.
 - Only draws under the current rules (since 27 September 2016) are evaluated, as earlier ones had other star pools and prize ranks.
 
@@ -150,3 +150,15 @@ The analysis uses the standard library only (no `pandas`).
 5. `cli.py` — tie it all together
 6. `backtest.py` — evaluate the strategies on held-out draws
 7. Tests throughout each step
+
+---
+
+## Changes to the Original Plan
+
+Where the implementation departs from the plan as first written, the text above was updated; the original wording is kept here.
+
+- **Data source**: the plan suggested the euromillions.com results page or a `lottolyzer` dataset. The official FDJ archives are used instead: complete since 2004, with the winners and prize of every rank, which the backtest needs.
+- **Hot and cold numbers**: the plan said "appearing significantly more (less) than average recently". No threshold of significance is applied: numbers above (below) their expected count in the recent window are ranked by z-score, which is shown next to each. With 50 numbers on screen, a z-score beyond 2 is nothing unusual, and a threshold would call chance a signal.
+- **Gap analysis**: the plan said "average interval between appearances". The figure reported is the average number of draws *without* the number between two appearances, i.e. that interval minus one, so that it compares directly with the current and the longest gap.
+- **Structure**: `schedule.py`, `errors.py` and `__main__.py` were not in the planned structure; `pandas` is not used.
+- **Backtesting** (phase 6) was added to the plan while it was being implemented.

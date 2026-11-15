@@ -67,6 +67,9 @@ _CACHE_VERSION = 1
 # of 0.3 MB at most, all downloaded in a few seconds.
 _MAX_DOWNLOAD_BYTES = 5 * 1024 * 1024
 _MAX_DOWNLOAD_SECONDS = 120.0
+#: A response is read in blocks of this size, and both limits are checked after each
+#: block: small enough for a slow response to be noticed soon after the time limit.
+_BLOCK_BYTES = 8 * 1024
 _MAX_ARCHIVES = 20
 _MAX_CSV_FILES = 4
 _MAX_CSV_BYTES = 2 * 1024 * 1024
@@ -337,9 +340,11 @@ def fetch_draws(
     The archives are those linked from FDJ's history page or, if that page is unavailable
     or lists none, :data:`KNOWN_ARCHIVE_URLS`. A partial or inconsistent history is never
     returned. :class:`FetchError` is raised if an archive cannot be downloaded or parsed, if
-    two rows disagree about a draw, or if the draws are not the complete schedule up to
-    ``now`` (a timezone-aware datetime, by default the current time): starting with the
-    first draw ever, each on a draw day, without a hole of more than two weeks.
+    two rows give different balls for the same date, or if the draws are not the complete
+    schedule up to ``now`` (a timezone-aware datetime, by default the current time):
+    starting with the first draw ever, each on a draw day and none after today, without a
+    hole of more than two weeks. Of several rows for the same draw, the first one that
+    carries prizes is kept.
 
     ``timeout`` applies to each request. A ``session`` passed in is used as it is; without
     one, a temporary session is created that sends a generic User-Agent, no credentials,
@@ -374,10 +379,12 @@ def _check_history(draws: Sequence[Draw], now: dt.datetime | None) -> None:
     if not draws:
         raise FetchError("the history holds no draw")
     latest = schedule.previous_draw(now).date()
+    # The time of a draw is approximate: its result may be out a little before it.
+    today = schedule.today(now)
     for draw in draws:
         if not schedule.is_draw_day(draw.date):
             raise FetchError(f"{draw.date} ({draw.date:%A}) is not a draw day")
-        if draw.date > latest:
+        if draw.date > today:
             raise FetchError(f"{draw.date} is in the future")
     if draws[0].date != FIRST_DRAW_DATE:
         raise FetchError(f"the history starts on {draws[0].date} instead of {FIRST_DRAW_DATE}")
@@ -428,7 +435,9 @@ def _download(session: requests.Session, url: str, *, timeout: float) -> bytes:
     """GET ``url`` and return the response body.
 
     Redirects are refused rather than followed to wherever they lead, and so are responses
-    that are too large or take too long (``timeout`` only bounds each wait for data).
+    that are too large or too slow. ``timeout`` bounds each wait for data; the time taken
+    by the whole response is checked after each block read, so a response that keeps
+    trickling in is given up once a block completes past the limit.
     """
     body = bytearray()
     deadline = time.monotonic() + _MAX_DOWNLOAD_SECONDS
@@ -437,7 +446,7 @@ def _download(session: requests.Session, url: str, *, timeout: float) -> bytes:
             if 300 <= response.status_code < 400:
                 raise FetchError(f"{url}: unexpected redirect (HTTP {response.status_code})")
             response.raise_for_status()
-            for chunk in response.iter_content(chunk_size=64 * 1024):
+            for chunk in response.iter_content(chunk_size=_BLOCK_BYTES):
                 body += chunk
                 if len(body) > _MAX_DOWNLOAD_BYTES:
                     raise FetchError(f"{url}: response larger than {_MAX_DOWNLOAD_BYTES} bytes")

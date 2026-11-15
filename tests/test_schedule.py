@@ -14,6 +14,7 @@ from euromillions.schedule import (
     is_draw_day,
     next_draw,
     previous_draw,
+    today,
 )
 
 UTC = dt.timezone.utc
@@ -107,6 +108,15 @@ def test_other_timezones_are_converted_to_paris_time() -> None:
     assert next_draw(sydney) == paris(2026, 11, 13, 21, 5)
 
 
+def test_today_is_the_date_in_paris() -> None:
+    assert today(paris(2026, 11, 13, 21, 4)) == dt.date(2026, 11, 13)
+    # Thursday 23:30 UTC is already Friday in Paris.
+    assert today(dt.datetime(2026, 11, 12, 23, 30, tzinfo=UTC)) == dt.date(2026, 11, 13)
+    # Friday 00:30 in Auckland is still Thursday in Paris.
+    auckland = dt.datetime(2026, 11, 13, 0, 30, tzinfo=ZoneInfo("Pacific/Auckland"))
+    assert today(auckland) == dt.date(2026, 11, 12)
+
+
 def test_results_are_in_paris_time() -> None:
     now = dt.datetime(2026, 11, 11, 12, 0, tzinfo=UTC)
     assert next_draw(now).tzinfo is DRAW_TIMEZONE
@@ -128,6 +138,8 @@ def test_naive_datetimes_are_rejected() -> None:
         next_draw(dt.datetime(2026, 11, 10, 12, 0))
     with pytest.raises(ValueError, match="timezone-aware"):
         previous_draw(dt.datetime(2026, 11, 10, 12, 0))
+    with pytest.raises(ValueError, match="timezone-aware"):
+        today(dt.datetime(2026, 11, 10, 12, 0))
 
 
 def test_defaults_to_the_current_time() -> None:
@@ -137,5 +149,10 @@ def test_defaults_to_the_current_time() -> None:
     after = dt.datetime.now(tz=UTC)
     assert before < upcoming
     assert latest <= after
+    assert (
+        before.astimezone(DRAW_TIMEZONE).date()
+        <= today()
+        <= dt.datetime.now(tz=DRAW_TIMEZONE).date()
+    )
     # Zero days in the unlikely case where a draw took place between the two calls.
     assert (upcoming.date() - latest.date()).days in {0, 3, 4}

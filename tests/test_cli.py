@@ -600,7 +600,12 @@ class TestBacktest:
         assert "at least one in about 43% of backtests" in output
         assert "Only a value beyond about +/-2.9" in output
         assert "from prize ranks 4 to 13" in output
-        assert "The 3 top ranks, jackpot included, hold about half of the prize money" in output
+        assert (
+            "The 3 top ranks, jackpot included, hold about half of the prize money, but a line "
+            "wins one of them about once in 2.1 million times: far too rare for a backtest to "
+            "measure."
+        ) in output
+        assert "Top ranks won here" not in output
         assert "EUR 0.30 per line for the My Million raffle, which is not simulated" in output
         assert "With fewer than 1000 lines per strategy, luck dominates these figures." in output
         two = " ".join(
@@ -625,6 +630,16 @@ class TestBacktest:
         output = run("backtest", *arguments, data_dir=paid_dir).output
         row = next(line for line in output.splitlines() if line.startswith("hot "))
         assert re.fullmatch(r"hot +[\d,.]+ -[\d,.]+ +-100\.0% +\d+\.\d% .*", row)
+
+    def test_a_strategy_given_twice_is_shown_once(self, paid_dir: Path) -> None:
+        once = run("backtest", "--strategy", "hot", "--seed", "1", data_dir=paid_dir)
+        twice = run(
+            "backtest", "--strategy", "hot", "--strategy", "hot", "--seed", "1", data_dir=paid_dir
+        )
+        assert twice.exit_code == 0
+        # One row, and two z-scores to read together rather than four.
+        assert twice.output == once.output
+        assert len(re.findall(r"^hot ", twice.output, re.MULTILINE)) == 2  # one per table
 
     def test_seed_makes_the_output_reproducible(self, paid_dir: Path) -> None:
         first = run("backtest", "--seed", "4", "--strategy", "hot", data_dir=paid_dir).output
@@ -790,6 +805,12 @@ class TestExactOutput:
         arguments = ("--strategy", "hot", "--lines", "2", "--train-fraction", "0.6")
         output = run("backtest", *arguments, data_dir=tmp_path).output
         assert output.startswith(f"{BACKTEST_INTRODUCTION}\n{BACKTEST_TABLES}\n- Amounts are")
+        # The jackpot hit is told apart: the by-chance row has nothing to compare it with.
+        assert (
+            "\n- Top ranks won here: hot, EUR 60,000,000.00 with 1 line. The by-chance row\n"
+            "  leaves these ranks out: set that money aside before comparing, and read it as\n"
+            "  luck that every line had the same chance of.\n"
+        ) in output
         # The jackpot that nobody won that day is valued by estimate, and said to be.
         assert "\n- 1 win valued by estimate: the rank had no winner that day" in output
         assert (

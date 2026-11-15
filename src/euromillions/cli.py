@@ -596,6 +596,9 @@ def _render_backtest(report: Backtest) -> list[str]:
     z_scores = 2 * len(report.results)
     normal = statistics.NormalDist()
     beyond_two = 2 * (1 - normal.cdf(2))
+    top_odds = 1 / sum(
+        backtest.RANK_PROBABILITIES[rank] for rank in range(1, backtest.TOP_RANKS + 1)
+    )
     notes = [
         "Amounts are in euros. ROI is the net result over the cost; Wins is the share of "
         "lines that won a prize.",
@@ -611,7 +614,8 @@ def _render_backtest(report: Backtest) -> list[str]:
         f"+/-{normal.inv_cdf(1 - 0.05 / (2 * z_scores)):.1f} that holds with other seeds "
         "and periods would point to a real edge, and a small one could go unnoticed.",
         f"The {backtest.TOP_RANKS} top ranks, jackpot included, hold about half of the "
-        "prize money but are far too rare to show up in a backtest."
+        f"prize money, but a line wins one of them about once in {top_odds / 1e6:.1f} million "
+        "times: far too rare for a backtest to measure."
         + (
             " The cost includes EUR 0.30 per line for the My Million raffle, which is not "
             "simulated; by design, the draw returns half of the other EUR 2.20 in prizes "
@@ -620,6 +624,18 @@ def _render_backtest(report: Backtest) -> list[str]:
             else ""
         ),
     ]
+    lucky = [result for result in report.results if result.top_wins]
+    if lucky:
+        top_wins = "; ".join(
+            f"{result.strategy}, EUR {result.top_winnings:,.2f} with "
+            f"{_count(result.top_wins, 'line')}"
+            for result in lucky
+        )
+        notes.append(
+            f"Top ranks won here: {top_wins}. The by-chance row leaves these ranks out: set that "
+            "money aside before comparing, and read it as luck that every line had the same "
+            "chance of."
+        )
     if played < _FEW_LINES:
         notes.append(
             f"With fewer than {_FEW_LINES} lines per strategy, luck dominates these figures."

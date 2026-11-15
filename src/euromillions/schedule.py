@@ -41,6 +41,11 @@ def _paris_time(now: dt.datetime | None) -> dt.datetime:
     return now.astimezone(DRAW_TIMEZONE)
 
 
+def today(now: dt.datetime | None = None) -> dt.date:
+    """Return the date in Paris at ``now`` (default: the current time)."""
+    return _paris_time(now).date()
+
+
 def next_draw(now: dt.datetime | None = None) -> dt.datetime:
     """Return the first scheduled draw strictly after ``now`` (default: the current time)."""
     current = _paris_time(now)

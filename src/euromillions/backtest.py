@@ -93,12 +93,15 @@ class StrategyResult:
     ``estimated_wins`` counts the wins whose amount had to be estimated: a top
     rank that nobody actually won that day (valued at the average pool of that
     rank in earlier draws), or a rank whose number of winners is unknown.
+    ``top_winnings`` is the part of ``winnings`` won in the top ranks, which the
+    chance yardstick of a :class:`Backtest` leaves out.
     """
 
     strategy: str
     lines: int
     cost: float
     winnings: float
+    top_winnings: float
     wins_by_rank: dict[int, int]
     estimated_wins: int
     best_win: Win | None
@@ -120,6 +123,11 @@ class StrategyResult:
     @property
     def winning_lines(self) -> int:
         return sum(self.wins_by_rank.values())
+
+    @property
+    def top_wins(self) -> int:
+        """Lines that won one of the top ranks."""
+        return sum(self.wins_by_rank[rank] for rank in range(1, TOP_RANKS + 1))
 
     @property
     def win_rate(self) -> float:
@@ -147,6 +155,8 @@ class Backtest:
     win on the same draws from the common ranks (4 to 13), and
     ``chance_winnings_sd`` the standard deviation of that amount: the yardstick
     for the winnings of every strategy, whose differences are otherwise noise.
+    It is to be compared with what a strategy won in those ranks, that is
+    without its ``top_winnings``.
     """
 
     train_draws: int
@@ -178,7 +188,8 @@ def backtest(
     """Play ``strategies`` on the most recent part of the history and report the outcome.
 
     The oldest ``train_fraction`` of the draws is the training set. Each later
-    draw is played with ``lines`` lines per strategy. With ``refresh`` (the
+    draw is played with ``lines`` lines per strategy, each strategy being
+    evaluated once however many times it is named. With ``refresh`` (the
     default) the lines are suggested afresh before every draw from all the
     draws that precede it, the way the tool would be used week after week;
     without it they are suggested once from the training set and replayed
@@ -207,6 +218,8 @@ def backtest(
         )
     if not (line_price > 0 and math.isfinite(line_price)):
         raise ValueError(f"line_price must be a positive amount, got {line_price}")
+    # Named twice, a strategy would fill a second row with the same run or, unseeded, another.
+    strategies = list(dict.fromkeys(strategies))
 
     # The tiny offset keeps e.g. 0.58 * 100 (57.99999999999999 in floating point) at 58 draws.
     split = math.floor(len(history) * train_fraction + 1e-9)
@@ -308,7 +321,7 @@ def _play(
     from all the draws before the one being played: never from that draw itself.
     """
     wins_by_rank = dict.fromkeys(sorted(PRIZE_RANKS.values()), 0)
-    winnings = 0.0
+    winnings = top_winnings = 0.0
     estimated_wins = 0
     best_win: Win | None = None
     matches: dict[BallKind, int] = {"main": 0, "star": 0}
@@ -340,6 +353,7 @@ def _play(
             amount, estimated = _prize(history, index, rank, count)
             wins_by_rank[rank] += count
             winnings += amount * count
+            top_winnings += amount * count if rank <= TOP_RANKS else 0.0
             estimated_wins += count if estimated else 0
             if best_win is None or amount > best_win.amount:
                 best_win = Win(draw.date, rank, amount)
@@ -358,6 +372,7 @@ def _play(
         lines=total_lines,
         cost=total_lines * line_price,
         winnings=winnings,
+        top_winnings=top_winnings,
         wins_by_rank=wins_by_rank,
         estimated_wins=estimated_wins,
         best_win=best_win,

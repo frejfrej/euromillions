@@ -88,6 +88,9 @@ class TestScoring:
         # To the cent, which the jackpot would otherwise hide.
         small_prizes = 2 * rank_13 + rank_6 + rank_9 + rank_5
         assert result.winnings - jackpot == pytest.approx(small_prizes, abs=1e-6)
+        # What was won in the top ranks is also kept apart: chance is not compared with it.
+        assert result.top_winnings == pytest.approx(jackpot)
+        assert result.top_wins == 1
         assert result.net == pytest.approx(result.winnings - 15.0)
         assert result.roi == pytest.approx(result.net / 15.0)
         assert result.wins_by_rank == {
@@ -121,6 +124,7 @@ class TestScoring:
         (result,) = backtest(history, ["hot"], train_fraction=0.8, lines=2).results
         assert result.wins_by_rank[13] == 2
         assert result.winnings == pytest.approx(2 * 100.0 / 3)  # the pool of 100 split in three
+        assert (result.top_winnings, result.top_wins) == (0.0, 0)
         assert result.estimated_wins == 0
         assert result.best_win == Win(dates[4], 13, approx(100.0 / 3))
 
@@ -140,6 +144,8 @@ class TestScoring:
         (result,) = backtest(history, ["hot"], train_fraction=0.8, lines=2).results
         assert result.wins_by_rank[3] == 2
         assert result.winnings == pytest.approx(300.0)
+        assert result.top_winnings == pytest.approx(300.0)
+        assert result.top_wins == 2
         assert result.estimated_wins == 2
 
     def test_estimates_ignore_the_draws_played_under_other_rules(
@@ -190,6 +196,7 @@ class TestScoring:
         never_won = [Draw(d.date, d.numbers, d.stars, TYPICAL_PRIZES) for d in scenario]
         (result,) = backtest(never_won, ["hot"], train_fraction=0.6, lines=1, refresh=False).results
         assert result.wins_by_rank[1] == 1
+        assert (result.top_winnings, result.top_wins) == (0.0, 1)
         assert result.estimated_wins == 1
         assert result.best_win is not None
         assert result.best_win.rank == 6  # the jackpot hit is worth nothing here
@@ -363,6 +370,7 @@ class TestRuns:
             assert abs(result.main_z) < 4
             assert abs(result.star_z) < 4
             assert result.estimated_wins == 0
+            assert (result.top_winnings, result.top_wins) == (0.0, 0)
 
     def test_a_seed_makes_the_backtest_reproducible(self, paid_history: list[Draw]) -> None:
         history = paid_history[:80]
@@ -415,6 +423,13 @@ class TestRuns:
 
 
 class TestValidation:
+    def test_a_strategy_named_twice_is_evaluated_once(self, paid_history: list[Draw]) -> None:
+        report = backtest(paid_history, ["hot", "random", "hot"], seed=3)
+        assert [result.strategy for result in report.results] == ["hot", "random"]
+        assert report == backtest(paid_history, ["hot", "random"], seed=3)
+        # Also without a seed, where a second run would otherwise differ from the first.
+        assert len(backtest(paid_history, ["anti", "anti"]).results) == 1
+
     def test_unknown_strategy(self, paid_history: list[Draw]) -> None:
         with pytest.raises(ValueError, match=r"lucky.*hot.*random"):
             backtest(paid_history, ["hot", "lucky"])
