@@ -346,3 +346,10 @@ class TestReviewFixes:
         headers = {"Origin": f"http://localhost:{client.port}", "Sec-Fetch-Site": "same-origin"}
         status, _, _ = client.request("GET", "/api/status", headers=headers)
         assert status == 200
+
+    @pytest.mark.parametrize("path", ["/", "/suggest.html", "/api/status"])
+    def test_cross_site_navigation_still_opens_the_pages(
+        self, client: Client, history: list[Draw], path: str
+    ) -> None:
+        # A link from another site, or a page opened by a browser extension.
+        assert client.request("GET", path, headers={"Sec-Fetch-Site": "cross-site"})[0] == 200

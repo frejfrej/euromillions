@@ -292,7 +292,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _dispatch(self, method: str) -> None:
         try:
-            self._check_host()
+            self._check_host(method)
             url = urlsplit(self.path)
             routes = self._routes()
             if url.path in routes:
@@ -323,12 +323,18 @@ class _Handler(BaseHTTPRequestHandler):
             message = f"unexpected error: {exc!r}"
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": message})
 
-    def _check_host(self) -> None:
-        """Refuse requests that name another host (DNS rebinding) or come from another site."""
+    def _check_host(self, method: str) -> None:
+        """Refuse requests that name another host (DNS rebinding), and changes asked by
+        another site (cross-site request forgery).
+
+        Reading stays open to links from other sites: they cannot see the answers.
+        """
         port = self.server.server_address[1]
         hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
         if self.headers.get("Host") not in hosts:
             raise HttpError(HTTPStatus.FORBIDDEN, "this server only answers to 127.0.0.1")
+        if method == "GET":
+            return
         origin = self.headers.get("Origin")
         cross_site = self.headers.get("Sec-Fetch-Site") == "cross-site"
         if cross_site or (origin is not None and origin not in {f"http://{h}" for h in hosts}):
