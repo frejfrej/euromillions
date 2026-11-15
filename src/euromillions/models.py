@@ -8,6 +8,7 @@ pool grew over time (which matters when analysing the full draw history).
 from __future__ import annotations
 
 import datetime as dt
+import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -25,6 +26,9 @@ MAIN_MAX = 50
 #: Lucky Stars drawn per draw, and the size of their pool under the current rules (1-12).
 STAR_COUNT = 2
 STAR_MAX = 12
+
+#: Different lines that can be played under the current rules: 139,838,160.
+POSSIBLE_LINES = math.comb(MAIN_MAX, MAIN_COUNT) * math.comb(STAR_MAX, STAR_COUNT)
 
 #: Date of the very first EuroMillions draw.
 FIRST_DRAW_DATE = dt.date(2004, 2, 13)

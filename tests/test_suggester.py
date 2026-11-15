@@ -11,7 +11,7 @@ import pytest
 from euromillions import analyzer
 from euromillions import suggester as suggester_module
 from euromillions.errors import HistoryError
-from euromillions.models import Draw, Suggestion
+from euromillions.models import POSSIBLE_LINES, Draw, Suggestion
 from euromillions.suggester import (
     BASELINE,
     STRATEGIES,
@@ -127,6 +127,11 @@ class TestArgumentValidation:
     def test_lines_must_be_positive(self, lines: int, history: list[Draw]) -> None:
         with pytest.raises(ValueError, match="lines"):
             suggest(history, "hot", lines=lines)
+
+    def test_no_more_lines_than_there_are_different_ones(self, history: list[Draw]) -> None:
+        assert POSSIBLE_LINES == 139_838_160
+        with pytest.raises(ValueError, match="only 139,838,160 different lines"):
+            suggest(history, "hot", lines=POSSIBLE_LINES + 1)
 
     @pytest.mark.parametrize("window", [0, -5])
     def test_window_must_be_positive(self, window: int, history: list[Draw]) -> None:

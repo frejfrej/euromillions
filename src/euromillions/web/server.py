@@ -39,8 +39,6 @@ _CONTENT_TYPES = {
 }
 _MAX_BODY = 64 * 1024
 _INTEGER = re.compile(r"-?[0-9]+")
-#: Lines a backtest may play per draw, as on the command line.
-_MAX_BACKTEST_LINES = 50
 
 NO_HISTORY = "no draw history yet: use Update data to download it"
 
@@ -206,6 +204,9 @@ def _required_int(query: Mapping[str, list[str]], name: str, default: int) -> in
     return value
 
 
+_KIND_NAMES = {int: "a whole number", float: "a number", bool: "true or false"}
+
+
 def _body_value(body: Mapping[str, Any], name: str, kind: type, default: Any) -> Any:
     """Return ``body[name]``, or ``default`` when absent or null, checked to be a ``kind``.
 
@@ -216,7 +217,7 @@ def _body_value(body: Mapping[str, Any], name: str, kind: type, default: Any) ->
     if value is None:
         return default
     if isinstance(value, bool) != (kind is bool):
-        raise ValueError(f"{name} must be a {kind.__name__}, got {value!r}")
+        raise ValueError(f"{name} must be {_KIND_NAMES[kind]}, got {value!r}")
     if kind is float and isinstance(value, (int, float)):
         try:
             number = float(value)
@@ -226,8 +227,22 @@ def _body_value(body: Mapping[str, Any], name: str, kind: type, default: Any) ->
             raise ValueError(f"{name} must be a finite number")
         return number
     if not isinstance(value, kind):
-        raise ValueError(f"{name} must be a {kind.__name__}, got {value!r}")
+        raise ValueError(f"{name} must be {_KIND_NAMES[kind]}, got {value!r}")
     return value
+
+
+def _body_seed(body: Mapping[str, Any]) -> int | None:
+    """Return the seed of ``body``: a whole number, or its digits as a string.
+
+    The page sends the digits, as a JavaScript number loses those of seeds beyond 2**53.
+    """
+    value = body.get("seed")
+    if isinstance(value, str):
+        if not _INTEGER.fullmatch(value.strip()):
+            raise ValueError(f"seed must be a whole number, got {value!r}")
+        return int(value)
+    seed: int | None = _body_value(body, "seed", int, None)
+    return seed
 
 
 def _backtest_settings(body: Mapping[str, Any]) -> dict[str, Any]:
@@ -235,14 +250,14 @@ def _backtest_settings(body: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(strategies, list) or not all(isinstance(s, str) for s in strategies):
         raise ValueError("strategies must be a list of strategy names")
     lines = _body_value(body, "lines", int, 5)
-    if not 1 <= lines <= _MAX_BACKTEST_LINES:
-        raise ValueError(f"lines must be between 1 and {_MAX_BACKTEST_LINES}, got {lines}")
+    if lines < 1:
+        raise ValueError(f"lines must be at least 1, got {lines}")
     return {
         "strategies": strategies,
         "train_fraction": _body_value(body, "trainFraction", float, 0.8),
         "lines": lines,
         "window": _body_value(body, "window", int, analyzer.DEFAULT_WINDOW),
-        "seed": _body_value(body, "seed", int, None),
+        "seed": _body_seed(body),
         "refresh": _body_value(body, "refresh", bool, True),
         "line_price": _body_value(body, "price", float, LINE_PRICE),
     }
@@ -250,7 +265,10 @@ def _backtest_settings(body: Mapping[str, Any]) -> dict[str, Any]:
 
 def _settings_for_the_page(settings: Mapping[str, Any]) -> dict[str, Any]:
     names = {"train_fraction": "trainFraction", "line_price": "price"}
-    return {names.get(key, key): value for key, value in settings.items()}
+    page = {names.get(key, key): value for key, value in settings.items()}
+    if page.get("seed") is not None:
+        page["seed"] = str(page["seed"])  # as text, for the same reason as in _body_seed
+    return page
 
 
 # --- HTTP ---------------------------------------------------------------------------------------

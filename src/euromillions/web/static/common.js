@@ -146,7 +146,7 @@ const EM = (() => {
   const pct = (share, digits = 1) => negative(share, percent(num(share * 100, digits)));
   const signedPct = (share, digits = 1) => percent(signed(share * 100, digits));
   // Percentage points, for a spread around a percentage: "± 2.1 pts".
-  const points = (share, digits = 1) => tr(`${num(share * 100, digits)} pts`, `${num(share * 100, digits)}${NBSP}pts`);
+  const points = (share, digits = 1) => `${num(share * 100, digits)}${NBSP}pts`;
   const capitalize = (text) => text.charAt(0).toUpperCase() + text.slice(1);
 
   // ``count(3, "draw", "tirage")``: "3 draws" or "3 tirages". Irregular nouns are given as
@@ -226,6 +226,18 @@ const EM = (() => {
       numbers.map((n) => ball(n, { size })),
       el("span", { class: "gap", "aria-hidden": "true" }),
       stars.map((n) => ball(n, { star: true, size })));
+  }
+
+  // The recent windows on offer, as a segmented control like the other choices: ``pick(window)``
+  // on a click. ``data-key`` and ``data-focus`` let a page give the focus back after redrawing.
+  const WINDOWS = [50, 100, 200];
+
+  function windowChoice(current, pick, labelId) {
+    return el("div", { class: "segmented", role: "group", "aria-labelledby": labelId },
+      WINDOWS.map((w) => el("button", {
+        type: "button", "aria-pressed": String(w === Number(current)),
+        "data-key": `window-${w}`, "data-focus": `window-${w}`, onclick: () => pick(w),
+      }, count(w, "draw", "tirage"))));
   }
 
   // --- The frame of every page ---
@@ -399,7 +411,7 @@ const EM = (() => {
 
   return {
     tr, language, get, send, el, icon, ball, line, num, fixed, signed, euro, pct, signedPct, points,
-    count, capitalize, date, monthYear, longMonth, longDate, parisParts, countdown, zBin, notice,
+    count, windowChoice, capitalize, date, monthYear, longMonth, longDate, parisParts, countdown, zBin, notice,
     disclaimer, start, currentStatus, strategyName, strategyDescription, NNBSP,
   };
 })();

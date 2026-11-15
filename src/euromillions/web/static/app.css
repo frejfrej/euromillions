@@ -108,7 +108,7 @@ main {
 .split { display: flex; flex-wrap: wrap; gap: 24px; align-items: flex-start; }
 .split > .wide { flex: 999 1 620px; min-width: 0; display: flex; flex-direction: column; gap: 24px; }
 .split > .side { flex: 1 1 300px; min-width: 0; }
-.scroll-x { overflow-x: auto; }
+.scroll-x { overflow-x: auto; padding: 4px; margin: -4px; } /* room for the selection ring */
 
 .button {
   min-height: 44px; padding: 0 16px; border-radius: 8px; border: 1px solid var(--line-strong);
@@ -136,6 +136,9 @@ main {
   background: var(--white);
 }
 .field .hint { font-size: 13px; color: var(--ink-2); }
+.field > .segmented { align-self: flex-start; }
+.field .hint.error { color: var(--error-ink); }
+.field input[aria-invalid="true"] { border-color: var(--error-ink); }
 
 .ball {
   width: 44px; height: 44px; flex: none; border-radius: 50%; border: 1.5px solid var(--ink);

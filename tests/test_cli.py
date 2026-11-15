@@ -507,6 +507,11 @@ class TestSuggest:
         assert DISCLAIMER in result.output
         assert max(len(line) for line in result.output.splitlines()) <= 80
 
+    def test_has_no_upper_limit_on_lines(self, data_dir: Path) -> None:
+        result = run("suggest", "--strategy", "anti", "--lines", "60", data_dir=data_dir)
+        assert result.exit_code == 0
+        assert len(LINE_PATTERN.findall(result.output)) == 60
+
     def test_defaults_to_five_balanced_lines(self, data_dir: Path) -> None:
         result = run("suggest", data_dir=data_dir)
         assert result.exit_code == 0

@@ -12,7 +12,7 @@ from euromillions import schedule, suggester
 from euromillions.analyzer import number_stats, recent
 from euromillions.backtest import RANK_PROBABILITIES, backtest
 from euromillions.fetcher import UpdateResult
-from euromillions.models import DISCLAIMER, Draw, format_line
+from euromillions.models import DISCLAIMER, POSSIBLE_LINES, Draw, format_line
 from euromillions.web import api
 
 from .conftest import LINE_A, LINE_B, TYPICAL_PRIZES, SuggestSpy, random_history
@@ -41,6 +41,8 @@ class TestStatus:
         assert [s["name"] for s in status["strategies"]] == list(suggester.STRATEGIES)
         assert status["disclaimer"] == DISCLAIMER
         assert status["minTrainFraction"] is None
+        assert status["minTrainDraws"] is None
+        assert status["averageReturn"] is None
 
     def test_status_of_a_history(self) -> None:
         history = random_history(300, prizes=TYPICAL_PRIZES)
@@ -57,6 +59,8 @@ class TestStatus:
         assert api.status(history, now=after_draw(history[-1], days=14))["behind"] is True
         # The history starts under the current rules: the smallest split is one draw.
         assert status["minTrainFraction"] == pytest.approx(0.004)
+        assert status["minTrainDraws"] == 1
+        assert status["averageReturn"]["draws"] == 300
 
     def test_the_smallest_train_fraction_starts_under_the_current_rules(self) -> None:
         history = random_history(100, start=dt.date(2016, 1, 1), prizes=TYPICAL_PRIZES)
@@ -64,6 +68,16 @@ class TestStatus:
         fraction = api.status(history)["minTrainFraction"]
         assert older / 100 <= fraction < (older + 1) / 100
         backtest(history, ["random"], train_fraction=fraction, seed=1)  # accepted
+
+    def test_the_smallest_training_set_in_draws(self) -> None:
+        history = random_history(100, start=dt.date(2016, 1, 1), prizes=TYPICAL_PRIZES)
+        older = sum(draw.date < dt.date(2016, 9, 27) for draw in history)
+        assert api.status(history)["minTrainDraws"] == older
+        # The page sends a number of draws as a fraction of the history: it splits there.
+        result = backtest(history, ["random"], train_fraction=older / 100, seed=1)
+        assert result.train_draws == older
+        with pytest.raises(ValueError, match="current rules"):
+            backtest(history, ["random"], train_fraction=(older - 1) / 100, seed=1)
 
 
 class TestAnalysis:
@@ -126,10 +140,16 @@ class TestSuggestion:
         assert line["text"] == format_line(line["numbers"], line["stars"])
         assert first["basedOn"] == {"draws": 200, "last": history[-1].date.isoformat()}
 
-    @pytest.mark.parametrize("lines", [0, 11])
-    def test_suggestion_rejects_bad_lines(self, lines: int) -> None:
-        with pytest.raises(ValueError, match="between 1 and 10"):
+    @pytest.mark.parametrize(
+        ("lines", "message"), [(0, "at least 1"), (POSSIBLE_LINES + 1, "different lines")]
+    )
+    def test_suggestion_rejects_bad_lines(self, lines: int, message: str) -> None:
+        with pytest.raises(ValueError, match=message):
             api.suggestion(random_history(50), strategy="hot", lines=lines, window=50, seed=1)
+
+    def test_suggestion_of_many_lines(self) -> None:
+        payload = api.suggestion(random_history(50), strategy="hot", lines=60, window=50, seed=1)
+        assert len({line["text"] for line in payload["lines"]}) == 60
 
 
 class TestBacktestResult:

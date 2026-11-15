@@ -167,15 +167,21 @@ the data source.
 - **Patterns** — histogram of the sum by bands of 10 with the central 80% marked; odd/even and
   low/high splits as bars with the fair-draw figure as a tick; consecutive numbers; range;
   pairs, triplets and star pairs with their expected count and the luckiest-by-chance figure.
-- **Suggest** — strategy picker (descriptions from `suggester.STRATEGIES`); lines 1 to 10; the
+- **Suggest** — strategy picker (descriptions from `suggester.STRATEGIES`); the number of lines
+  or a budget in euros, linked (no upper limit but the 139,838,160 different lines); both left
+  empty, the page shows the number of lines that maximizes the expected winnings, which is 0,
+  with the average return of a line (`averageReturn` in the status: prizes paid over lines sold
+  since the current rules) and the expected loss for 0, 1, 5 and 10 lines; the
   recent window (50 / 100 / 200) only for the strategies that use it; an editable seed with a
   **New seed** button; the lines update as the settings change; **Copy lines** puts them on the
   clipboard in the CLI's format (`models.format_line`). A short "what to expect" note links to the
   Backtest screen; when a backtest has run in this server session it quotes that run's return on
   stake for the chosen strategy, otherwise it says that in the backtest every strategy loses about
   as much as random lines.
-- **Backtest** — the CLI's settings; the smallest train fraction the history allows is shown and
-  enforced (the evaluation has to start under the current rules); **Run** shows a progress bar
+- **Backtest** — the CLI's settings, the training set given as a number of draws (sent as a
+  fraction of the history, which splits exactly there); the smallest training set the history
+  allows (`minTrainDraws`) is shown and enforced (the evaluation has to start under the current
+  rules); settings the server would refuse are reported in the page's language; **Run** shows a progress bar
   with `done` / `total` and **Cancel**. Results: a headline sentence **built from the result**,
   never hard-coded; stat tiles; a dot plot of each strategy's winnings over the chance band (±1
   and ±2 standard deviations, average line); the results table; wins per prize rank with the
@@ -195,7 +201,8 @@ the data source.
   outside now and then, and that only a result that holds with other seeds and periods would
   mean something. The page never ranks the strategies as better or worse.
 
-**Analysis options.** The Numbers screen has a window select (50 / 100 / 200 draws, default 50):
+**Analysis options.** The Numbers screen has a window choice (50 / 100 / 200 draws, default 50, a
+segmented control like the other choices, on every screen):
 it sets N in the period toggle and the window of the hot and cold lists, like `analyze --window`.
 Rankings show the top 10, like the CLI's default. `analyze --last` (every figure limited to the
 last N draws) is not exposed; it goes in `PLAN.md` under "Changes to the original plan".
@@ -249,4 +256,4 @@ sketch, or inline SVG); CSS details within the look above; the order of the work
 - Reading notes: figures from Python, sentences written by each page.
 - The backtest headline and dot plot use the CLI's two tests (common-rank winnings within ±2 SD of
   chance; match z-scores against the real-edge threshold), with no new statistic.
-- Window select on Numbers; `analyze --last` and `--top` not exposed.
+- Window choice on Numbers; `analyze --last` and `--top` not exposed.

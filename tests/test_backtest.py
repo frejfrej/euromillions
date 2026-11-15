@@ -623,3 +623,33 @@ class TestReadingFigures:
             math.sqrt(WIN_PROBABILITY * (1 - WIN_PROBABILITY) / 2000)
         )
         assert backtest_module.FEW_LINES == 1000
+
+
+class TestAverageReturn:
+    def test_prizes_paid_over_lines_sold(self) -> None:
+        [draw] = random_history(1, prizes=TYPICAL_PRIZES)
+        sold = TYPICAL_PRIZES[-1].winners / backtest_module.RANK_PROBABILITIES[13]
+        paid = sum(tier.winners * tier.prize for tier in TYPICAL_PRIZES)
+        average = backtest_module.average_return([draw])
+        assert average is not None
+        assert average.draws == 1
+        assert average.amount == pytest.approx(paid / sold)
+
+    def test_a_won_jackpot_counts_where_it_was_won(self) -> None:
+        quiet, won = random_history(2, prizes=TYPICAL_PRIZES)
+        jackpot = (PrizeTier(1, 100_000_000.0), *TYPICAL_PRIZES[1:])
+        won = Draw(won.date, won.numbers, won.stars, jackpot)
+        sold = TYPICAL_PRIZES[-1].winners / backtest_module.RANK_PROBABILITIES[13]
+        paid = sum(tier.winners * tier.prize for tier in TYPICAL_PRIZES)
+        average = backtest_module.average_return([quiet, won])
+        assert average is not None
+        assert average.amount == pytest.approx((2 * paid + 100_000_000) / (2 * sold))
+
+    def test_only_draws_with_every_prize_under_the_current_rules(self) -> None:
+        older = random_history(3, start=dt.date(2015, 1, 6), prizes=TYPICAL_PRIZES)
+        unknown = random_history(3, start=dt.date(2017, 1, 3))
+        no_winners = [
+            Draw(d.date, d.numbers, d.stars, tuple(PrizeTier(0, t.prize) for t in TYPICAL_PRIZES))
+            for d in random_history(3, start=dt.date(2018, 1, 2))
+        ]
+        assert backtest_module.average_return([*older, *unknown, *no_winners]) is None

@@ -3,7 +3,6 @@
 
 (() => {
   const { el, tr } = EM;
-  const WINDOWS = [50, 100, 200];
   const SHOWN = 6; // entries per ranking card
   const state = { window: 50, recent: false, kind: "main", n: null };
   let analysis = null;
@@ -17,10 +16,10 @@
     await refresh();
   });
 
-  async function refresh() {
+  async function refresh(focusKey) {
     analysis = await EM.get(`/api/analysis?window=${state.window}&top=${SHOWN}`);
     if (state.n === null) state.n = analysis.mostDrawn.length ? analysis.mostDrawn[0].number : 1;
-    render();
+    render(focusKey);
   }
 
   function render(focusKey) {
@@ -88,22 +87,20 @@
 
   function periodControls() {
     const toggle = (recent, text) => el("button", {
-      type: "button", "aria-pressed": String(state.recent === recent),
-      onclick: () => { state.recent = recent; render(); },
+      type: "button", "aria-pressed": String(state.recent === recent), "data-key": recent ? "period-recent" : "period-full",
+      onclick: (event) => { state.recent = recent; render(event.currentTarget.dataset.key); },
     }, text);
-    const select = el("select", {
-      id: "window", onchange: async (event) => {
-        state.window = Number(event.target.value);
-        await refresh();
-      },
-    }, WINDOWS.map((w) => el("option", { value: w, selected: w === state.window }, lastDraws(w))));
     return el("div", { class: "row", style: "align-items: flex-end; gap: 12px 24px" },
       el("div", { class: "field", style: "flex: 0 1 auto; min-width: 0" },
         el("span", { class: "label", id: "periodLabel" }, tr("Period", "Période")),
         el("div", { class: "segmented", role: "group", "aria-labelledby": "periodLabel" },
           toggle(false, tr("Full history", "Tout l’historique")), toggle(true, lastDraws(analysis.window)))),
       el("div", { class: "field", style: "flex: 0 1 auto; min-width: 0" },
-        el("label", { for: "window" }, tr("Recent window", "Période récente")), select));
+        el("span", { class: "label", id: "windowLabel" }, tr("Recent window", "Période récente")),
+        EM.windowChoice(state.window, async (w) => {
+          state.window = w;
+          await refresh(`window-${w}`);
+        }, "windowLabel")));
   }
 
   function legend() {
@@ -181,16 +178,17 @@
       [tr("z-score", "Score z"), EM.signed(s.z, 2), ""],
       [tr("Share of draws", "Part des tirages"), EM.pct(s.frequency, 1), ""],
       [tr("Average gap", "Écart moyen"), s.averageGap === null ? "—" : tr(`${EM.fixed(s.averageGap)} draws`, `${EM.fixed(s.averageGap)} tirages`), ""],
-      [tr("Current gap", "Écart actuel"), s.currentGap === 0 ? tr("drawn last time", "sorti au dernier tirage") : draws(s.currentGap), ""],
+      [tr("Current gap", "Écart actuel"), s.currentGap === 0 ? tr("drawn last time", star ? "sortie au dernier tirage" : "sorti au dernier tirage") : draws(s.currentGap), ""],
       [tr("Longest gap", "Plus long écart"), draws(s.longestGap), ""],
       [tr("Last seen", "Dernière sortie"), s.lastSeen ? EM.date(s.lastSeen) : tr("not in this period", "pas sur cette période"), ""],
     ];
     const since = star ? analysis.starPoolSince[s.number] : null;
     if (since) rows.push([tr("In the pool since", "Dans le tirage depuis le"), EM.date(since), ""]);
     const total = state.recent ? Math.min(analysis.window, analysis.totalDraws) : analysis.totalDraws;
-    if (s.eligible < total) rows.push([tr("Draws it could come up in", "Tirages où il pouvait sortir"), EM.num(s.eligible), ""]);
-    const summary = s.z >= 1 ? tr("Drawn more often than expected", "Sorti plus souvent que prévu")
-      : s.z <= -1 ? tr("Drawn less often than expected", "Sorti moins souvent que prévu")
+    if (s.eligible < total) rows.push([tr("Draws it could come up in", star ? "Tirages où elle pouvait sortir" : "Tirages où il pouvait sortir"), EM.num(s.eligible), ""]);
+    const drawn = star ? "Sortie" : "Sorti";
+    const summary = s.z >= 1 ? tr("Drawn more often than expected", `${drawn} plus souvent que prévu`)
+      : s.z <= -1 ? tr("Drawn less often than expected", `${drawn} moins souvent que prévu`)
         : tr("Close to what fair draws give", "Proche de ce que donnent des tirages équitables");
     const pool = star ? 12 : 50;
     const z = EM.fixed(analysis.chance.extremeZ[kind]);
@@ -220,22 +218,22 @@
       el("div", { style: "display: flex; flex-direction: column; gap: 2px" },
         el("h3", {}, title), el("p", { class: "small muted" }, sub)),
       el("div", {}, entries.map((s) => {
-        const [main, side] = describe(s);
+        const [main, side] = describe(s, false);
         return el("div", { class: "ranking-entry" }, EM.ball(s.number, { size: "small" }),
           el("span", { class: "what" }, main), el("span", { class: "small muted num" }, side));
       })),
       starEntries.length
         ? el("div", { class: "chips", "aria-label": tr("Lucky Stars", "Étoiles") },
           el("span", { class: "small muted", style: "align-self: center" }, tr("Stars", "Étoiles")),
-          starEntries.slice(0, 3).map((s) => el("span", { class: "chip" }, `${s.number} · ${describe(s).join(" · ")}`)))
+          starEntries.slice(0, 3).map((s) => el("span", { class: "chip" }, `${s.number} · ${describe(s, true).join(" · ")}`)))
         : null,
       el("p", { class: "small muted", style: "border-top: 1px solid var(--line-soft); padding-top: 10px" }, note));
   }
 
   function rankings() {
     const counted = (s) => [EM.count(s.count, "time", ["fois", "fois"]), `z ${EM.signed(s.z, 1)}`];
-    const absent = (s) => [EM.count(s.currentGap, "draw", "tirage"),
-      s.lastSeen ? tr(`since ${EM.date(s.lastSeen)}`, `depuis le ${EM.date(s.lastSeen)}`) : tr("never drawn", "jamais sorti")];
+    const absent = (s, star) => [EM.count(s.currentGap, "draw", "tirage"),
+      s.lastSeen ? tr(`since ${EM.date(s.lastSeen)}`, `depuis le ${EM.date(s.lastSeen)}`) : tr("never drawn", star ? "jamais sortie" : "jamais sorti")];
     const z = EM.fixed(analysis.chance.extremeZ.main);
     const w = analysis.window;
     const top = tr(`Fair draws put the top of 50 z-scores near +${z}.`, `Des tirages équitables placent le plus haut des 50 scores z vers +${z}.`);

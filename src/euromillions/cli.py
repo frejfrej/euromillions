@@ -168,7 +168,7 @@ _SUGGEST_HELP = "Suggest lines for the next draw.\n\n\b\nStrategies:\n" + "\n".j
 )
 @click.option(
     "--lines",
-    type=click.IntRange(1, 50),
+    type=click.IntRange(min=1),
     default=_DEFAULT_LINES,
     show_default=True,
     help="Lines to suggest.",
@@ -207,7 +207,7 @@ def suggest(cache_path: Path, strategy: str, lines: int, window: int, seed: int 
 )
 @click.option(
     "--lines",
-    type=click.IntRange(1, 50),
+    type=click.IntRange(min=1),
     default=_DEFAULT_LINES,
     show_default=True,
     help="Lines played on each draw.",
