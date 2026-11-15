@@ -13,11 +13,11 @@
           "Where fair draws give an exact figure, it is shown next to what happened.")),
       EM.disclaimer(),
       sums(analysis),
-      el("div", { class: "cards", style: "grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 24px" },
+      el("div", { class: "cards", style: "grid-template-columns: repeat(auto-fit, minmax(min(340px, 100%), 1fr)); gap: 24px" },
         split(analysis, "Odd and even", "How many of the five numbers are odd", analysis.oddCounts, ["odd", "even"]),
         split(analysis, "Low and high", `Low is 1 to ${analysis.lowMax}, high is ${analysis.lowMax + 1} to 50`,
           analysis.lowCounts, ["low", "high"])),
-      el("div", { class: "cards", style: "grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 24px" },
+      el("div", { class: "cards", style: "grid-template-columns: repeat(auto-fit, minmax(min(340px, 100%), 1fr)); gap: 24px" },
         consecutive(analysis), range(analysis)),
       together(analysis));
   });

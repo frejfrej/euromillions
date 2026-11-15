@@ -187,3 +187,7 @@ def test_analysis_gives_the_fair_mean_of_the_sum() -> None:
 
 def test_status_gives_the_line_price() -> None:
     assert api.status([])["linePrice"] == 2.5
+
+
+def test_status_gives_the_start_of_the_current_rules() -> None:
+    assert api.status([])["currentRulesSince"] == "2016-09-27"

@@ -17,6 +17,7 @@ from euromillions.analyzer import Distribution, NumberStats, Ranking
 from euromillions.backtest import Backtest, StrategyResult
 from euromillions.fetcher import UpdateResult
 from euromillions.models import (
+    CURRENT_RULES_SINCE,
     DISCLAIMER,
     LINE_PRICE,
     MAIN_COUNT,
@@ -74,6 +75,7 @@ def status(draws: Sequence[Draw], *, now: dt.datetime | None = None) -> JSON:
         ],
         "minTrainFraction": backtest.min_train_fraction(history),
         "linePrice": LINE_PRICE,
+        "currentRulesSince": CURRENT_RULES_SINCE.isoformat(),
         "disclaimer": DISCLAIMER,
     }
 

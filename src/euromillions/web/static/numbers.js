@@ -93,11 +93,11 @@
       },
     }, WINDOWS.map((w) => el("option", { value: w, selected: w === state.window }, `Last ${w} draws`)));
     return el("div", { class: "row", style: "align-items: flex-end; gap: 12px 24px" },
-      el("div", { class: "field", style: "flex: 0 0 auto" },
+      el("div", { class: "field", style: "flex: 0 1 auto; min-width: 0" },
         el("span", { class: "label", id: "periodLabel" }, "Period"),
         el("div", { class: "segmented", role: "group", "aria-labelledby": "periodLabel" },
           toggle(false, "Full history"), toggle(true, `Last ${analysis.window} draws`))),
-      el("div", { class: "field", style: "flex: 0 0 auto" },
+      el("div", { class: "field", style: "flex: 0 1 auto; min-width: 0" },
         el("label", { for: "window" }, "Recent window"), select));
   }
 
