@@ -26,15 +26,32 @@
     el("span", { class: "small muted" }, label), el("span", { class: "value" }, value),
     note ? el("span", { class: "small muted" }, note) : null);
 
+  // A histogram of ``bands`` of ``step`` values, with the central share of ``dist`` marked.
+  function histogram(bands, step, dist, total, what, height) {
+    const peak = Math.max(...bands.map((band) => band.draws));
+    const room = (100 * (height - 28)) / height; // the tallest bar leaves room for the label
+    const index = (value) => bands.findIndex((band) => value < band.from + step);
+    const first = index(dist.low) + 1;
+    const last = index(dist.high) + 1;
+    const largest = bands.reduce((best, band) => (band.draws > best.draws ? band : best));
+    const every = Math.ceil(bands.length / 10);
+    return el("div", {
+      class: "histogram", role: "img",
+      style: `grid-template-columns: repeat(${bands.length}, minmax(0, 1fr)); grid-template-rows: ${height}px auto`,
+      "aria-label": `Histogram of ${what}: ${EM.pct(dist.centralShare, 0)} of draws between ${dist.low} and ` +
+        `${dist.high}; the most common band is ${largest.from} to ${largest.from + step - 1}, with ${EM.plural(largest.draws, "draw")}.`,
+    },
+      el("div", { class: "band", style: `grid-column: ${first} / ${last + 1}` }, `${EM.pct(dist.centralShare, 0)} of draws`),
+      bands.map((band, i) => el("div", {
+        class: "bar", title: `${band.from}–${band.from + step - 1}: ${EM.plural(band.draws, "draw")} (${EM.pct(band.draws / total)})`,
+        style: `grid-column: ${i + 1}; height: ${(room * band.draws / peak).toFixed(1)}%`,
+      })),
+      el("div", { class: "baseline" }),
+      bands.map((band, i) => el("span", { class: "tick", style: `grid-column: ${i + 1}` }, i % every ? "" : band.from)));
+  }
+
   function sums(analysis) {
     const sums = analysis.sums;
-    const bands = analysis.sumBands;
-    const peak = Math.max(...bands.map((band) => band.draws));
-    const index = (value) => bands.findIndex((band) => value < band.from + 10);
-    const first = index(sums.low) + 1;
-    const last = index(sums.high) + 1;
-    const largest = bands.reduce((best, band) => (band.draws > best.draws ? band : best));
-    const total = analysis.totalDraws;
     return el("section", { class: "card", "aria-labelledby": "sumTitle" },
       el("div", { class: "card-head" },
         el("div", {}, el("h2", { id: "sumTitle" }, "Sum of the five numbers"),
@@ -44,20 +61,7 @@
         tile("Median", String(sums.median)),
         tile(`${EM.pct(sums.centralShare, 0)} of draws`, `${sums.low} – ${sums.high}`),
         tile("Lowest · highest", `${sums.min} · ${sums.max}`, `standard deviation ${sums.stdev.toFixed(1)}`)),
-      el("div", {
-        class: "histogram", role: "img",
-        style: `grid-template-columns: repeat(${bands.length}, minmax(0, 1fr))`,
-        "aria-label": `Histogram of the sum of the five main numbers: ${EM.pct(sums.centralShare, 0)} of draws sum ` +
-          `to between ${sums.low} and ${sums.high}; the most common band is ${largest.from} to ${largest.from + 9}, ` +
-          `with ${EM.num(largest.draws)} draws.`,
-      },
-        el("div", { class: "band", style: `grid-column: ${first} / ${last + 1}` }, `${EM.pct(sums.centralShare, 0)} of draws`),
-        bands.map((band, i) => el("div", {
-          class: "bar", title: `${band.from}–${band.from + 9}: ${EM.plural(band.draws, "draw")} (${EM.pct(band.draws / total)})`,
-          style: `grid-column: ${i + 1}; height: ${(88 * band.draws / peak).toFixed(1)}%`, // room for the label
-        })),
-        el("div", { class: "baseline" }),
-        bands.map((band, i) => el("span", { class: "tick", style: `grid-column: ${i + 1}` }, i % 2 ? "" : band.from))));
+      histogram(analysis.sumBands, 10, sums, analysis.totalDraws, "the sum of the five main numbers", 220));
   }
 
   function split(analysis, title, sub, counts, [yes, no]) {
@@ -111,8 +115,10 @@
         el("span", { style: "font-size: 44px; font-weight: 650; line-height: 1" }, `${r.low} – ${r.high}`),
         el("span", { class: "muted" }, `for ${EM.pct(r.centralShare, 0)} of draws`)),
       el("div", { class: "stat-tiles", style: "grid-template-columns: repeat(2, minmax(0, 1fr))" },
-        tile("Mean", r.mean.toFixed(1)), tile("Median", String(r.median)),
-        tile("Narrowest", String(r.min)), tile("Widest", String(r.max))));
+        tile("Mean", r.mean.toFixed(1), `standard deviation ${r.stdev.toFixed(1)}`), tile("Median", String(r.median)),
+        tile("Narrowest", String(r.min)), tile("Widest", String(r.max))),
+      el("p", { class: "small muted" }, "Draws per band of 5"),
+      histogram(analysis.rangeBands, 5, r, analysis.totalDraws, "the range of the five main numbers", 140));
   }
 
   function together(analysis) {

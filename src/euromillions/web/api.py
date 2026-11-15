@@ -193,6 +193,7 @@ def analysis(
         "sums": {**_distribution(report.sums), "fairMean": MAIN_COUNT * (MAIN_MAX + 1) / 2},
         "sumBands": _bands(report.sums, 10),
         "ranges": _distribution(report.ranges),
+        "rangeBands": _bands(report.ranges, 5),
         "oddCounts": report.odd_counts,
         "lowCounts": report.low_counts,
         "lowMax": analyzer.LOW_MAX,

@@ -191,3 +191,10 @@ def test_status_gives_the_line_price() -> None:
 
 def test_status_gives_the_start_of_the_current_rules() -> None:
     assert api.status([])["currentRulesSince"] == "2016-09-27"
+
+
+def test_analysis_groups_the_range_by_five() -> None:
+    history = random_history(200)
+    bands = api.analysis(history)["rangeBands"]
+    assert sum(band["draws"] for band in bands) == 200
+    assert all(band["from"] % 5 == 0 for band in bands)
