@@ -114,6 +114,7 @@ main {
   min-height: 44px; padding: 0 16px; border-radius: 8px; border: 1px solid var(--line-strong);
   background: var(--surface); font-weight: 650; font-size: 14px; cursor: pointer;
   display: inline-flex; align-items: center; gap: 8px; text-decoration: none; color: var(--ink);
+  white-space: nowrap; flex: none;
 }
 .button.primary { background: var(--button); border-color: var(--button); color: var(--white); }
 .button:disabled { opacity: 0.55; cursor: progress; }

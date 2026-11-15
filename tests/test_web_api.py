@@ -183,3 +183,7 @@ def test_analysis_says_when_the_late_stars_joined_the_pool() -> None:
 
 def test_analysis_gives_the_fair_mean_of_the_sum() -> None:
     assert api.analysis(SIX_DRAWS)["sums"]["fairMean"] == 127.5
+
+
+def test_status_gives_the_line_price() -> None:
+    assert api.status([])["linePrice"] == 2.5

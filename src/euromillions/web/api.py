@@ -73,6 +73,7 @@ def status(draws: Sequence[Draw], *, now: dt.datetime | None = None) -> JSON:
             for name, description in suggester.STRATEGIES.items()
         ],
         "minTrainFraction": backtest.min_train_fraction(history),
+        "linePrice": LINE_PRICE,
         "disclaimer": DISCLAIMER,
     }
 
