@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import datetime as dt
 import math
-import statistics
 import textwrap
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -43,8 +42,6 @@ _LABEL_WIDTH = 18
 _UTC = dt.timezone.utc
 #: Lines suggested, or played on each draw of a backtest, unless told otherwise.
 _DEFAULT_LINES = 5
-#: Below this many lines per strategy, a backtest says very little.
-_FEW_LINES = 1000
 #: (main numbers, Lucky Stars) to match for each prize rank.
 _RANK_MATCHES = {rank: matches for matches, rank in PRIZE_RANKS.items()}
 
@@ -584,7 +581,7 @@ def _render_backtest(report: Backtest) -> list[str]:
             f"{report.chance_winnings_sd:,.2f}",
             f"{report.chance_winnings_sd:,.2f}",
             f"{report.chance_winnings_sd / cost:.1%}",
-            f"{math.sqrt(win * (1 - win) / played):.1%}",
+            f"{backtest.win_rate_sd(played):.1%}",
             "",
             "",
         ).rstrip(),
@@ -594,11 +591,7 @@ def _render_backtest(report: Backtest) -> list[str]:
     ]
 
     z_scores = 2 * len(report.results)
-    normal = statistics.NormalDist()
-    beyond_two = 2 * (1 - normal.cdf(2))
-    top_odds = 1 / sum(
-        backtest.RANK_PROBABILITIES[rank] for rank in range(1, backtest.TOP_RANKS + 1)
-    )
+    beyond_two = backtest.Z_BEYOND_TWO
     notes = [
         "Amounts are in euros. ROI is the net result over the cost; Wins is the share of "
         "lines that won a prize.",
@@ -610,12 +603,13 @@ def _render_backtest(report: Backtest) -> list[str]:
         "Numbers and Stars: average matches per line, with the z-score against pure chance "
         f"in brackets. Chance alone puts a z-score beyond +/-2 about once in "
         f"{1 / beyond_two:.0f}: with {z_scores} of them here, at least one in about "
-        f"{1 - (1 - beyond_two) ** z_scores:.0%} of backtests. Only a value beyond about "
-        f"+/-{normal.inv_cdf(1 - 0.05 / (2 * z_scores)):.1f} that holds with other seeds "
+        f"{backtest.chance_of_extreme_z(z_scores):.0%} of backtests. Only a value beyond about "
+        f"+/-{backtest.edge_threshold(z_scores):.1f} that holds with other seeds "
         "and periods would point to a real edge, and a small one could go unnoticed.",
         f"The {backtest.TOP_RANKS} top ranks, jackpot included, hold about half of the "
-        f"prize money, but a line wins one of them about once in {top_odds / 1e6:.1f} million "
-        "times: far too rare for a backtest to measure."
+        "prize money, but a line wins one of them about once in "
+        f"{backtest.TOP_RANK_ODDS / 1e6:.1f} million times: far too rare for a backtest to "
+        "measure."
         + (
             " The cost includes EUR 0.30 per line for the My Million raffle, which is not "
             "simulated; by design, the draw returns half of the other EUR 2.20 in prizes "
@@ -636,9 +630,10 @@ def _render_backtest(report: Backtest) -> list[str]:
             "money aside before comparing, and read it as luck that every line had the same "
             "chance of."
         )
-    if played < _FEW_LINES:
+    if played < backtest.FEW_LINES:
         notes.append(
-            f"With fewer than {_FEW_LINES} lines per strategy, luck dominates these figures."
+            f"With fewer than {backtest.FEW_LINES} lines per strategy, luck dominates these "
+            "figures."
         )
     estimated = sum(result.estimated_wins for result in report.results)
     if estimated:
@@ -673,8 +668,10 @@ def _render_wins_by_rank(report: Backtest) -> list[str]:
     def row(name: str, cells: Iterable[str]) -> str:
         return f"{name:<9}" + "".join(f"{cell:>5}" for cell in cells)
 
+    chance = backtest.expected_wins(played)
+
     def expected(rank: int) -> str:
-        count = played * backtest.RANK_PROBABILITIES[rank]
+        count = chance[rank]
         return f"{count:.0f}" if count >= 100 else f"{count:.1f}"
 
     return [

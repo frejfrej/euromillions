@@ -562,3 +562,64 @@ class TestValidation:
     ) -> None:
         mixed = [*history[:240], *paid_history[240:300]]
         assert backtest(mixed, [RANDOM], train_fraction=0.8, seed=1).test_draws == 60
+
+
+class TestProgress:
+    def test_progress_reports_every_draw_played(
+        self, scenario: list[Draw], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(suggester, "suggest", SuggestSpy([LINE_A, LINE_B]))
+        calls: list[tuple[int, int]] = []
+        backtest(
+            scenario,
+            ["hot", "cold"],
+            train_fraction=0.6,
+            lines=1,
+            progress=lambda done, total: calls.append((done, total)),
+        )
+        assert calls == [(1, 6), (2, 6), (3, 6), (4, 6), (5, 6), (6, 6)]
+
+    def test_progress_counts_a_repeated_strategy_once(
+        self, scenario: list[Draw], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(suggester, "suggest", SuggestSpy([LINE_A]))
+        calls: list[tuple[int, int]] = []
+        backtest(
+            scenario,
+            ["hot", "hot"],
+            train_fraction=0.6,
+            lines=1,
+            progress=lambda done, total: calls.append((done, total)),
+        )
+        assert calls[-1] == (3, 3)
+
+    def test_an_exception_from_progress_stops_the_backtest(
+        self, scenario: list[Draw], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(suggester, "suggest", SuggestSpy([LINE_A]))
+        calls: list[int] = []
+
+        def stop_on_second(done: int, _total: int) -> None:
+            calls.append(done)
+            if done == 2:
+                raise RuntimeError("stop")
+
+        with pytest.raises(RuntimeError, match="stop"):
+            backtest(scenario, ["hot"], train_fraction=0.6, lines=1, progress=stop_on_second)
+        assert calls == [1, 2]
+
+
+class TestReadingFigures:
+    def test_reading_figures(self) -> None:
+        assert backtest_module.Z_BEYOND_TWO == pytest.approx(0.0455, abs=1e-4)
+        assert backtest_module.chance_of_extreme_z(12) == pytest.approx(0.43, abs=0.01)
+        assert backtest_module.edge_threshold(12) == pytest.approx(2.87, abs=0.01)
+        assert backtest_module.TOP_RANK_ODDS == pytest.approx(2.1e6, rel=0.05)
+        assert backtest_module.expected_wins(2000)[13] == pytest.approx(
+            2000 * RANK_PROBABILITIES[13]
+        )
+        assert sorted(backtest_module.expected_wins(1)) == list(range(1, 14))
+        assert backtest_module.win_rate_sd(2000) == pytest.approx(
+            math.sqrt(WIN_PROBABILITY * (1 - WIN_PROBABILITY) / 2000)
+        )
+        assert backtest_module.FEW_LINES == 1000
