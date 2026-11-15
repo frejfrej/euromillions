@@ -187,7 +187,7 @@ def analysis(
             "longestRuns": consecutive.longest_run_distribution,
             "fairShare": analyzer.fair_consecutive_share(),
         },
-        "sums": _distribution(report.sums),
+        "sums": {**_distribution(report.sums), "fairMean": MAIN_COUNT * (MAIN_MAX + 1) / 2},
         "sumBands": _bands(report.sums, 10),
         "ranges": _distribution(report.ranges),
         "oddCounts": report.odd_counts,

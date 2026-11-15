@@ -179,3 +179,7 @@ def test_analysis_says_when_the_late_stars_joined_the_pool() -> None:
         11: "2011-05-10",
         12: "2016-09-27",
     }
+
+
+def test_analysis_gives_the_fair_mean_of_the_sum() -> None:
+    assert api.analysis(SIX_DRAWS)["sums"]["fairMean"] == 127.5
