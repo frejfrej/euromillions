@@ -225,14 +225,15 @@
   }
 
   function tiles(result) {
-    const best = result.results.reduce((a, b) => (b.roi > a.roi ? b : a));
+    const within = result.results.filter((r) => r.withinChance).length;
     const tile = (name, value, note) => el("div", { class: "tile" },
       el("span", { class: "small muted" }, name), el("span", { class: "value" }, value),
       note ? el("span", { class: "small muted" }, note) : null);
     const ranks = result.reading.commonRanks;
     return el("div", { class: "stat-tiles" },
       tile("Staked per strategy", EM.euro(result.cost), EM.plural(result.lines, "line")),
-      tile("Best return on stake", EM.signedPct(best.roi), label(best.strategy)),
+      // No ranking of the strategies: how many did what chance does.
+      tile("Within chance", `${within} of ${result.results.length}`, "winnings within two standard deviations"),
       tile("Random lines, by chance", `${EM.signedPct(result.chance.roi)} ± ${EM.num(result.chance.roiSd * 100, 1)}`,
         `prize ranks ${ranks[0]} to ${ranks[ranks.length - 1]}`));
   }
