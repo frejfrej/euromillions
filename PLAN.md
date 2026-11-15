@@ -6,7 +6,7 @@ Build a Python tool that fetches historical EuroMillions draw results, performs 
 
 > **Disclaimer**: Lottery draws are random. No statistical method can predict or guarantee winning numbers. This project is for educational and entertainment purposes only.
 
-**Status**: all six phases below are implemented and tested.
+**Status**: all seven phases below are implemented and tested.
 
 ---
 
@@ -35,9 +35,14 @@ euromillions/
 │       ├── analyzer.py     # Statistical analysis engine
 │       ├── suggester.py    # Number suggestion strategies
 │       ├── backtest.py     # Evaluation of the strategies on held-out draws
-│       └── cli.py          # Command-line interface
+│       ├── cli.py          # Command-line interface
+│       └── web/            # Local web UI (`serve`)
+│           ├── api.py      # The data behind the pages, as JSON-ready dicts
+│           ├── server.py   # HTTP server on 127.0.0.1: pages, JSON API, backtest job
+│           └── static/     # Four pages, one stylesheet, plain JavaScript (no build step)
 ├── tests/                  # One test module per source module, plus fixtures
 ├── data/                   # Cached draw history (draws.json, not committed)
+├── docs/superpowers/       # Design and implementation plan of the web UI
 ├── PLAN.md
 └── README.md               (only if requested)
 ```
@@ -104,6 +109,9 @@ python -m euromillions backtest [--strategy NAME ...] [--train-fraction 0.8] [--
 
 # Show next draw date
 python -m euromillions next-draw
+
+# Browse it all in the browser (127.0.0.1 only)
+python -m euromillions serve [--port 8000] [--no-browser]
 ```
 
 The cache is `data/draws.json` under the current directory; another directory can be given
@@ -124,6 +132,24 @@ Check the hypotheses behind the strategies on data they have not seen, and measu
 - Compare every strategy with a uniformly random baseline and with pure chance: expected winnings of random lines on the same draws from prize ranks 4 to 13 (with their standard deviation), share of winning lines, average numbers and stars matched per line with exact z-scores, wins per prize rank. A win in the three top ranks is far too rare to be expected: it is reported apart, as luck.
 - Say how to read the result: with a dozen z-scores on screen, one beyond ±2 is expected in about four backtests out of ten; only a much larger value that holds across seeds and periods would point to predictive power. On the real history, every strategy loses about 80% of the stakes, like random lines.
 - Only draws under the current rules (since 27 September 2016) are evaluated, as earlier ones had other star pools and prize ranks.
+
+### Phase 7 — Web UI (`web/`)
+
+`euromillions serve` starts a local web server and opens four pages in the browser. The design is in
+`docs/superpowers/specs/2026-11-15-web-ui-design.md`.
+
+- **Numbers**: next and latest draw; the 50 numbers and 12 stars coloured by z-score, for the whole
+  history or the recent window; the details of the selected one; most and least drawn, hot, cold and
+  overdue, each with what chance alone produces.
+- **Patterns**: sum, range, odd/even and low/high splits against fair draws, consecutive numbers,
+  pairs, triplets and star pairs.
+- **Suggest**: the strategies with their settings and seed; the lines update as they change.
+- **Backtest**: the command line's settings, a progress bar with Cancel, and the result read against
+  chance: winnings in the common ranks within two standard deviations, match z-scores below the
+  threshold of a real edge.
+- Every figure is computed in Python, by the same functions as the command line (`web/api.py`); the
+  pages only lay them out. The server only listens on 127.0.0.1 and refuses requests naming another
+  host. No new dependency: `http.server` and plain HTML, CSS and JavaScript.
 
 ---
 
@@ -149,7 +175,8 @@ The analysis uses the standard library only (no `pandas`).
 4. `suggester.py` — generate suggestions
 5. `cli.py` — tie it all together
 6. `backtest.py` — evaluate the strategies on held-out draws
-7. Tests throughout each step
+7. `web/` — local web UI
+8. Tests throughout each step
 
 ---
 
@@ -162,3 +189,6 @@ Where the implementation departs from the plan as first written, the text above 
 - **Gap analysis**: the plan said "average interval between appearances". The figure reported is the average number of draws *without* the number between two appearances, i.e. that interval minus one, so that it compares directly with the current and the longest gap.
 - **Structure**: `schedule.py`, `errors.py` and `__main__.py` were not in the planned structure; `pandas` is not used.
 - **Backtesting** (phase 6) was added to the plan while it was being implemented.
+- **Web UI** (phase 7) was added afterwards. It does not expose `analyze --last` (every figure limited to
+  the last N draws) nor `--top`: rankings show their first entries, and the recent window is chosen among
+  50, 100 and 200 draws.
