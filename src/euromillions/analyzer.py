@@ -29,6 +29,7 @@ from itertools import combinations, pairwise
 from euromillions.errors import HistoryError
 from euromillions.models import (
     MAIN_COUNT,
+    MAIN_MAX,
     BallKind,
     Draw,
     chronological,
@@ -455,6 +456,30 @@ def typical_top_count(draws: int, chance: float, candidates: int) -> int:
         below += probability
         probability *= (draws - count) / (count + 1) * chance / (1 - chance)
     return draws
+
+
+def fair_split_shares() -> dict[int, float]:
+    """Return the probability that ``k`` of the main numbers of a fair draw are odd, by ``k``.
+
+    Half of the pool is odd, so ``k`` follows a hypergeometric law. Low numbers (1 to
+    :data:`LOW_MAX`) are half of the pool too: the same law gives the low/high split.
+    """
+    half = MAIN_MAX // 2
+    lines = math.comb(MAIN_MAX, MAIN_COUNT)
+    return {
+        k: math.comb(half, k) * math.comb(MAIN_MAX - half, MAIN_COUNT - k) / lines
+        for k in range(MAIN_COUNT + 1)
+    }
+
+
+def fair_consecutive_share() -> float:
+    """Return the probability that a fair draw holds at least two consecutive main numbers.
+
+    Lines without any two consecutive numbers correspond one to one to the choice of
+    ``MAIN_COUNT`` numbers among ``MAIN_MAX - MAIN_COUNT + 1``.
+    """
+    apart = math.comb(MAIN_MAX - MAIN_COUNT + 1, MAIN_COUNT)
+    return 1 - apart / math.comb(MAIN_MAX, MAIN_COUNT)
 
 
 # --- Full report --------------------------------------------------------------------------------

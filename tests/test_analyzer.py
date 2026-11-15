@@ -27,6 +27,8 @@ from euromillions.analyzer import (
     cold_numbers,
     consecutive_pairs,
     consecutive_stats,
+    fair_consecutive_share,
+    fair_split_shares,
     hot_numbers,
     longest_run,
     low_count,
@@ -1042,3 +1044,15 @@ class TestChanceYardsticks:
     def test_ranking_of_a_history_without_any_draw_with_todays_stars(self) -> None:
         ranking = analyze(ERAS[:2]).top_star_pairs
         assert ranking == Ranking(entries=[], more=0, expected=0.0, typical_top=0)
+
+
+class TestFairDrawFigures:
+    def test_fair_split_shares(self) -> None:
+        shares = fair_split_shares()
+        assert sorted(shares) == [0, 1, 2, 3, 4, 5]
+        assert sum(shares.values()) == pytest.approx(1)
+        assert shares[2] == pytest.approx(690_000 / 2_118_760)
+        assert shares[0] == shares[5] == pytest.approx(53_130 / 2_118_760)
+
+    def test_fair_consecutive_share(self) -> None:
+        assert fair_consecutive_share() == pytest.approx(1 - 1_370_754 / 2_118_760)
